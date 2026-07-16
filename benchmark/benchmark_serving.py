@@ -16,6 +16,10 @@ def get_launching_server_cmd(model_path, backend, server_config):
     else:
         raise ValueError(f'unknown backend: {backend}')
     for key, value in server_config.items():
+        # server_ip is only used by this wrapper to connect to the service.
+        # lmdeploy serve api_server expects --server-name instead.
+        if key == 'server_ip':
+            continue
         # Convert snake_case to kebab-case for command line args
         key = key.replace('_', '-')
         cmd.append(f'--{key}')
@@ -63,7 +67,7 @@ def get_server_ip_port(backend: str, server_config: dict) -> tuple[str, int]:
             server_port = int(parts[2])
         else:
             # Default to the server IP and port specified in the config
-            server_ip = server_config.get('server_ip', '0.0.0.0')
+            server_ip = server_config.get('server_ip', server_config.get('server_name', '0.0.0.0'))
             server_port = server_config.get('server_port', 23333)
     elif backend == 'sglang':
         return (server_config.get('server_ip', '0.0.0.0'), server_config.get('port', 30000))
@@ -93,7 +97,7 @@ def get_client_cmd(backend: str, server_ip: str, server_port: int, client_config
     """Generate the client benchmark command."""
     current_dir = os.path.dirname(os.path.abspath(__file__))
     if backend in ['turbomind', 'pytorch']:
-        backend = 'lmdeploy'
+        backend = client_config.pop('backend', 'lmdeploy')
     cmd = [
         'python3', f'{current_dir}/profile_restful_api.py', '--backend', backend, '--host', server_ip, '--port',
         str(server_port)
