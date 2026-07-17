@@ -21,8 +21,10 @@ ARG BASE_IMAGE=openmmlab/lmdeploy:latest
 FROM ${BASE_IMAGE}
 
 ARG BACKEND=pytorch
+ARG TRANSFORMERS_VERSION=5.13.0
 
 WORKDIR /opt/lmdeploy
+RUN python -m pip install --no-cache-dir --upgrade "transformers==${TRANSFORMERS_VERSION}"
 
 COPY . .
 
@@ -33,3 +35,5 @@ RUN if [ "$BACKEND" = "pytorch" ]; then \
     else \
         pip install --no-cache-dir --no-build-isolation -e . --no-deps; \
     fi
+
+RUN python -c "import transformers; print('transformers:', transformers.__version__); assert transformers.__version__ == '${TRANSFORMERS_VERSION}'"
