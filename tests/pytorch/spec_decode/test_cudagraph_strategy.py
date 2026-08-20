@@ -20,6 +20,15 @@ def test_arspec_cudagraph_keeps_full_spec_capture_for_eagle3():
     assert strategy.get_max_tokens(batch_size=8, origin_batch_size=8, num_tokens=40) == 40
 
 
+def test_mimo_cudagraph_preserves_intermediate_query_length_with_dp_padding():
+    """MiMo pre-captures q=2/q=3 graphs instead of padding them to q=k+1."""
+    strategy = ARSpecCudagraphStrategy(num_spec_tokens=3, method='mimo_mtp')
+
+    assert strategy.get_max_tokens(batch_size=4, origin_batch_size=2, num_tokens=4) == 8
+    assert strategy.get_max_tokens(batch_size=4, origin_batch_size=2, num_tokens=6) == 12
+    assert strategy.get_max_tokens(batch_size=4, origin_batch_size=2, num_tokens=8) == 16
+
+
 def test_cudagraph_fa3_metadata_uses_single_query_len_for_single_token_capture():
     from types import SimpleNamespace
 
@@ -74,6 +83,60 @@ def test_cudagraph_fa3_metadata_uses_single_query_len_for_single_token_capture()
     )
 
     assert model.max_seqlen_q_calls == [1, 1]
+
+
+def test_cudagraph_fill_preserves_runtime_attention_metadata():
+    from types import SimpleNamespace
+
+    import torch
+
+    from lmdeploy.pytorch.models.utils.cudagraph import CudaGraphMeta, CudaGraphMixin
+
+    model = CudaGraphMixin()
+    graph_meta = CudaGraphMeta(
+        max_batchs=2,
+        max_tokens=4,
+        num_blocks=2,
+        is_decoding=True,
+        device=torch.device('cpu'),
+        input_buffers={},
+        output_buffers={},
+        decode_query_len=2,
+    )
+    input_ids = torch.arange(4).view(1, 4)
+    position_ids = input_ids.clone()
+    attn_metadata = SimpleNamespace(
+        q_seqlens=torch.tensor([2, 2]),
+        block_offsets=torch.tensor([[3, 4], [5, 6]]),
+        q_start_loc=torch.tensor([0, 2]),
+        kv_seqlens=torch.tensor([7, 11]),
+    )
+    original_fields = {
+        name: getattr(attn_metadata, name).clone()
+        for name in ('q_seqlens', 'block_offsets', 'q_start_loc', 'kv_seqlens')
+    }
+    graph_meta.input_buffers = model.make_buffers_cudagraph(
+        graph_meta,
+        input_ids=input_ids,
+        position_ids=position_ids,
+        past_key_values=[],
+        attn_metadata=attn_metadata,
+    )
+
+    for _ in range(2):
+        graph_inputs = model.fill_buffers_cudagraph(
+            graph_meta,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            past_key_values=[],
+            attn_metadata=attn_metadata,
+            inputs_embeds=None,
+        )
+        for name, expected in original_fields.items():
+            assert torch.equal(getattr(attn_metadata, name), expected)
+        assert torch.equal(graph_inputs['attn_metadata'].q_seqlens[:2], original_fields['q_seqlens'])
+        assert torch.equal(graph_inputs['attn_metadata'].kv_seqlens[:2], original_fields['kv_seqlens'])
+        assert torch.equal(graph_inputs['attn_metadata'].block_offsets[:2], original_fields['block_offsets'])
 
 
 def test_cuda_graph_key_separates_query_len_without_target_hidden_size(monkeypatch):

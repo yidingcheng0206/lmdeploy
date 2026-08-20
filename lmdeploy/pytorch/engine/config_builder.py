@@ -212,14 +212,31 @@ class ConfigBuilder:
                                 trust_remote_code: bool = False,
                                 ):
         """Build spec decode config."""
+        if speculative_config is None:
+            return None
+        method = speculative_config.method
+        if method in ('deepseek_mtp', 'mimo_mtp'):
+            from lmdeploy.pytorch.transformers import config_from_pretrained
+            target_hf_config = config_from_pretrained(target_model, trust_remote_code=trust_remote_code)
+            if method == 'mimo_mtp':
+                if target_hf_config.model_type != 'mimo_v2_flash':
+                    raise ValueError(
+                        f'mimo_mtp requires a MiMo-V2-Flash target, got {target_hf_config.model_type!r}.')
+                if not 1 <= speculative_config.num_speculative_tokens <= 3:
+                    raise ValueError('MiMo-V2-Flash mimo_mtp requires 1 to 3 draft tokens per step, '
+                                     f'got {speculative_config.num_speculative_tokens}.')
+
         def _build_draft_dist_ctx(dist_config):
             # TODO support tp > 1, ep > 1 for other methods
-            if speculative_config.method == 'qwen3_5_mtp':
+            if method == 'qwen3_5_mtp':
                 draft_dist_config = dist_config
-            elif speculative_config.method == 'deepseek_mtp':
-                from lmdeploy.pytorch.transformers import config_from_pretrained
-                hf_config = config_from_pretrained(target_model, trust_remote_code=trust_remote_code)
-                draft_dist_config = dist_config if hf_config.model_type == 'glm_moe_dsa' else DistConfig()
+            elif method == 'deepseek_mtp':
+                # GLM-MoE-DSA shares target-side distributed components.
+                draft_dist_config = dist_config if target_hf_config.model_type == 'glm_moe_dsa' else DistConfig()
+            elif method == 'mimo_mtp':
+                # MiMo shares the target vocab-parallel embedding, so draft
+                # and target must use the same distributed context.
+                draft_dist_config = dist_config
             else:
                 draft_dist_config = DistConfig()
             return draft_dist_config
@@ -232,11 +249,12 @@ class ConfigBuilder:
                 draft_model = get_model(draft_model, engine_config.download_dir, engine_config.revision)
 
             specdecode_config = SpecDecodeConfig.from_config(
-                method=speculative_config.method,
+                method=method,
                 num_speculative_tokens=speculative_config.num_speculative_tokens,
                 model=draft_model,
                 target_model=target_model,
                 target_cache_cfg=cache_config,
+                max_session_len=engine_config.session_len,
                 dtype=engine_config.dtype,
                 trust_remote_code=trust_remote_code,
                 model_format=engine_config.model_format,

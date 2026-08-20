@@ -664,6 +664,7 @@ class SpecDecodeConfig:
     num_speculative_tokens: int = 1
     model_config: ModelConfig = None
     dist_config: DistConfig = field(default_factory=DistConfig)
+    max_session_len: int | None = None
 
     @classmethod
     def from_config(
@@ -678,6 +679,7 @@ class SpecDecodeConfig:
         model_format: str = None,
         hf_overrides: dict[str, Any] = None,
         dist_config: DistConfig = None,
+        max_session_len: int | None = None,
     ):
         model = model or target_model
         dist_config = dist_config or DistConfig()
@@ -711,6 +713,7 @@ class SpecDecodeConfig:
             model=model,
             method=method,
             cache_config=cache_config,
+            max_session_len=max_session_len,
             model_config=model_config,
             dist_config=dist_config,
             num_speculative_tokens=num_speculative_tokens,

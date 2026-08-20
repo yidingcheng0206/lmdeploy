@@ -1,12 +1,46 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+import pytest
 import torch
 
 from lmdeploy.messages import QuantPolicy
-from lmdeploy.pytorch.backends.cuda.attention.default import TritonAttentionMetadata
+from lmdeploy.pytorch.backends.cuda.attention import TritonAttentionBuilder
+from lmdeploy.pytorch.backends.cuda.attention.default import TritonAttentionImpl, TritonAttentionMetadata
 from lmdeploy.pytorch.backends.cuda.attention.fa3 import FA3Impl
 
 _BLOCK_SIZE = 16
 _PREFILL_SEQLENS = (29, 18)
+
+
+def test_attention_builder_falls_back_when_fa3_lacks_asymmetric_head_shape(monkeypatch):
+    """Avoid dispatching a head shape omitted from the installed FA3 wheel."""
+    flash_attn_config = pytest.importorskip('flash_attn_config')
+
+    flags = {
+        'FLASHATTENTION_DISABLE_HDIM192': False,
+        'FLASH_ATTENTION_DISABLE_HDIMDIFF192': True,
+    }
+    monkeypatch.setattr(flash_attn_config, 'CONFIG', {'build_flags': flags})
+    monkeypatch.setattr('lmdeploy.pytorch.backends.cuda.attention.use_fa3_warning', lambda: True)
+
+    impl = TritonAttentionBuilder.build(num_heads=8, head_size=192, num_kv_heads=2, v_head_size=128)
+
+    assert type(impl) is TritonAttentionImpl
+
+
+def test_fa3_uses_zero_as_disabled_softcap_sentinel(monkeypatch):
+    """FA3 must not inherit Triton's negative disabled-softcap sentinel."""
+    monkeypatch.setattr(
+        'lmdeploy.pytorch.third_party.flash_attn_interface.flash_attn_varlen_func',
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        'lmdeploy.pytorch.third_party.flash_attn_interface.flash_attn_with_kvcache',
+        lambda *args, **kwargs: None,
+    )
+
+    impl = FA3Impl(8, 192, num_kv_heads=2, v_head_size=128, logit_softcapping=0.0)
+
+    assert impl.logit_softcapping == 0.0
 
 
 def _make_prefill_metadata(q_seqlens, block_offsets):

@@ -130,6 +130,7 @@ class TritonAttentionImpl(AttentionImpl[TritonAttentionMetadata]):
         block_sparse_size: int = 1,
         **kwargs,
     ):
+        step_metadata_provider_factory = kwargs.pop('step_metadata_provider_factory', None)
         super().__init__(
             num_heads=num_heads,
             head_size=head_size,
@@ -159,11 +160,15 @@ class TritonAttentionImpl(AttentionImpl[TritonAttentionMetadata]):
 
         self.block_sparse_size = block_sparse_size
         self._step_meta_group: int | None = None
+        self._step_metadata_provider_factory = step_metadata_provider_factory
 
         register_step_metadata_impl(self)
 
     def get_step_metadata_provider(self):
         """Describe metadata required by this selected implementation."""
+        if self._step_metadata_provider_factory is not None:
+            return self._step_metadata_provider_factory()
+
         # Unknown subclasses keep the legacy model-config-driven path unless
         # they explicitly provide their own metadata contract.
         if type(self) is not TritonAttentionImpl:
@@ -420,6 +425,10 @@ class TritonAttentionImpl(AttentionImpl[TritonAttentionMetadata]):
         Returns:
             Attention output tensor.
         """
+        kernel_metadata = self.get_step_kernel_metadata(attn_metadata)
+        if kernel_metadata is not None:
+            attn_metadata = kernel_metadata
+
         # Shared preparation
         max_q_seqlen = self._get_max_q_seqlen(query, attn_metadata)
 
