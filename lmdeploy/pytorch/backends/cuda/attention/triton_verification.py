@@ -1,4 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+"""Triton metadata for multi-token speculative verification."""
+
 from collections.abc import Hashable
 from dataclasses import dataclass
 
@@ -7,21 +9,22 @@ from .default import TritonAttentionMetadata
 
 
 @dataclass(frozen=True)
-class MiMoVerificationMetaBuilder(CudaAttentionMetaBuilder[None, TritonAttentionMetadata | None]):
-    """Build rollback-safe MiMo target-verification graph metadata.
+class TritonVarlenVerificationMetaBuilder(CudaAttentionMetaBuilder[None, TritonAttentionMetadata | None]):
+    """Build graph metadata for multi-token verification with Triton.
 
-    The speculative scheduler classifies verification as decoding, while its q>1 attention operation is a varlen paged-
-    cache extend.  This provider is injected only by MiMo's Full and paged-SWA target attention operators.
+    A speculative scheduler may classify verification as decoding even though
+    its multi-token attention operation is a varlen paged-cache extend. This
+    provider redirects that operation to Triton's varlen path during graph
+    replay without changing ordinary single-token decoding.
     """
 
     @property
     def key(self) -> Hashable:
-        """Return a stable provider key shared by all MiMo attention ops."""
+        """Return a stable key shared by compatible verification operators."""
         return type(self)
 
     def build(self, step_context, sequence_metadata) -> None:
-        """Use eager metadata derivation outside CUDA Graph replay."""
-        # Eager verification already derives exact lengths in MiMoV2Attention.
+        """Keep the eager path's request-derived legacy metadata."""
         return None
 
     def apply_legacy_metadata(self, attn_metadata, metadata: TritonAttentionMetadata | None) -> None:
@@ -41,7 +44,7 @@ class MiMoVerificationMetaBuilder(CudaAttentionMetaBuilder[None, TritonAttention
         attn_metadata.max_kv_seqlen = metadata.max_kv_seqlen
 
     def make_cudagraph_buffer(self, graph_meta, input_buffers, step_context) -> None:
-        """Declare that this provider needs no private CUDA Graph buffer."""
+        """Reuse graph-owned sequence buffers instead of allocating state."""
         return None
 
     def fill_cudagraph_buffer(self, graph_meta, input_buffers, step_context,

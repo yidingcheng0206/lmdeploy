@@ -26,11 +26,13 @@ from .utils.cudagraph import CudaGraphMixin
 from .utils.model import DeployModelMixinV1, build_embedding
 
 
-def _build_mimo_verification_metadata_provider():
+def _build_triton_verification_metadata_provider():
     """Load the CUDA-only provider only while building a CUDA attention op."""
-    from lmdeploy.pytorch.backends.cuda.attention.mimo import MiMoVerificationMetaBuilder
+    from lmdeploy.pytorch.backends.cuda.attention.triton_verification import (
+        TritonVarlenVerificationMetaBuilder,
+    )
 
-    return MiMoVerificationMetaBuilder()
+    return TritonVarlenVerificationMetaBuilder()
 
 
 def _get_norm_eps(config: Any) -> float:
@@ -155,7 +157,7 @@ class MiMoV2Attention(nn.Module):
         )
         self.apply_rotary_pos_emb = ApplyRotaryEmb()
         verification_metadata_factory = (
-            _build_mimo_verification_metadata_provider
+            _build_triton_verification_metadata_provider
             if getattr(config, 'mimo_target_swa_paged', False)
             else None
         )
