@@ -1,5 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-"""Triton gather/scatter kernels for MiMo-V2-Flash BF16 SWA state rings."""
+"""Triton gather/scatter kernels for BF16 SWA state rings."""
 
 import torch
 import triton
@@ -7,7 +7,7 @@ import triton.language as tl
 
 
 @triton.jit
-def _gather_mimo_swa_ring_kernel(
+def _gather_swa_state_ring_kernel(
     ring_ptr,
     output_ptr,
     state_slots_ptr,
@@ -61,7 +61,7 @@ def _gather_mimo_swa_ring_kernel(
 
 
 @triton.jit
-def _scatter_mimo_swa_ring_kernel(
+def _scatter_swa_state_ring_kernel(
     tokens_ptr,
     ring_ptr,
     state_slots_ptr,
@@ -123,7 +123,7 @@ def _scatter_mimo_swa_ring_kernel(
 
 
 @triton.jit
-def _flatten_mimo_swa_ring_kernel(
+def _flatten_swa_state_ring_kernel(
     ring_ptr,
     current_ptr,
     output_ptr,
@@ -192,13 +192,13 @@ def _flatten_mimo_swa_ring_kernel(
 
 def _validate_ring(ring: torch.Tensor) -> None:
     if ring.dim() != 4:
-        raise ValueError(f'MiMo SWA ring must be [state_slots, window, heads, dim], got {tuple(ring.shape)}.')
+        raise ValueError(f'SWA state ring must be [state_slots, window, heads, dim], got {tuple(ring.shape)}.')
     if ring.dtype != torch.bfloat16:
-        raise TypeError(f'MiMo SWA ring must use torch.bfloat16, got {ring.dtype}.')
+        raise TypeError(f'SWA state ring must use torch.bfloat16, got {ring.dtype}.')
     if not ring.is_cuda:
-        raise ValueError('MiMo SWA ring kernels require CUDA tensors.')
+        raise ValueError('SWA state-ring kernels require CUDA tensors.')
     if ring.size(1) <= 1:
-        raise ValueError(f'MiMo SWA ring window must be greater than one, got {ring.size(1)}.')
+        raise ValueError(f'SWA state-ring window must be greater than one, got {ring.size(1)}.')
 
 
 def _validate_batch_vector(name: str, tensor: torch.Tensor, batch_size: int, device: torch.device) -> None:
@@ -210,13 +210,13 @@ def _validate_batch_vector(name: str, tensor: torch.Tensor, batch_size: int, dev
         raise TypeError(f'{name} must use int32 or int64, got {tensor.dtype}.')
 
 
-def gather_mimo_swa_ring(
+def gather_swa_state_ring(
     ring: torch.Tensor,
     state_slots: torch.Tensor,
     start_positions: torch.Tensor,
     history_limit: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Gather previous MiMo SWA state in chronological order.
+    """Gather previous SWA state in chronological order.
 
     Args:
         ring: One layer's state view with shape
@@ -224,8 +224,8 @@ def gather_mimo_swa_ring(
         state_slots: ``[batch]`` state row IDs.  A negative or out-of-range ID
             is a dummy sequence and contributes zero history tokens.
         start_positions: ``[batch]`` absolute positions of each current chunk.
-        history_limit: Maximum previous-token count.  MiMo uses
-            ``window_size - 1`` so the current query plus its history contains
+        history_limit: Maximum previous-token count. Using
+            ``window_size - 1`` keeps the current query plus its history within
             at most ``window_size`` tokens.
 
     Returns:
@@ -261,7 +261,7 @@ def gather_mimo_swa_ring(
 
     block_dim = triton.next_power_of_2(head_dim)
     grid = (batch_size, history_limit, num_heads)
-    _gather_mimo_swa_ring_kernel[grid](
+    _gather_swa_state_ring_kernel[grid](
         ring,
         output,
         state_slots,
@@ -283,7 +283,7 @@ def gather_mimo_swa_ring(
     return output, history_lens, cu_history_lens
 
 
-def flatten_mimo_swa_ring(
+def flatten_swa_state_ring(
     ring: torch.Tensor,
     current: torch.Tensor,
     state_slots: torch.Tensor,
@@ -337,7 +337,7 @@ def flatten_mimo_swa_ring(
 
     block_dim = triton.next_power_of_2(ring.size(3))
     grid = (batch_size, history_limit + max_q_seqlen, ring.size(2))
-    _flatten_mimo_swa_ring_kernel[grid](
+    _flatten_swa_state_ring_kernel[grid](
         ring,
         current,
         output,
@@ -365,7 +365,7 @@ def flatten_mimo_swa_ring(
     return output
 
 
-def scatter_mimo_swa_ring(
+def scatter_swa_state_ring(
     tokens: torch.Tensor,
     ring: torch.Tensor,
     state_slots: torch.Tensor,
@@ -373,7 +373,7 @@ def scatter_mimo_swa_ring(
     q_seqlens: torch.Tensor,
     cu_q_seqlens: torch.Tensor,
 ) -> None:
-    """Write each chunk's newest tokens into one layer's MiMo SWA ring.
+    """Write each chunk's newest tokens into one layer's SWA state ring.
 
     ``tokens`` is packed by sequence.  Valid state slot IDs must be unique
     within the batch.  At most the last ``window_size`` tokens of each chunk
@@ -408,7 +408,7 @@ def scatter_mimo_swa_ring(
     head_dim = ring.size(3)
     block_dim = triton.next_power_of_2(head_dim)
     grid = (batch_size, window_size, num_heads)
-    _scatter_mimo_swa_ring_kernel[grid](
+    _scatter_swa_state_ring_kernel[grid](
         tokens,
         ring,
         state_slots,

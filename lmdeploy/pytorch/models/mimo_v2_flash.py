@@ -1,18 +1,16 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+from __future__ import annotations
+
 import copy
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed as dist
 from torch import nn
 
-from lmdeploy.pytorch.backends.mimo_swa import (
-    MiMoSWAAttentionMetadata,
-    mimo_swa_state_attention,
-)
 from lmdeploy.pytorch.distributed import get_dist_manager, get_ep_world_rank, get_tp_world_rank
 from lmdeploy.pytorch.model_inputs import StepContext, StepContextManager
 from lmdeploy.pytorch.nn import ApplyRotaryEmb, Attention, RMSNorm, SiluAndMul, build_rotary_embedding
@@ -24,6 +22,9 @@ from .deepseek_v2 import DeepseekV2MoE
 from .patch import add_prefix, get_build_model_context
 from .utils.cudagraph import CudaGraphMixin
 from .utils.model import DeployModelMixinV1, build_embedding
+
+if TYPE_CHECKING:
+    from lmdeploy.pytorch.backends.cuda.attention.swa_state_ring import SWAStateRingMetadata
 
 
 def _build_triton_verification_metadata_provider():
@@ -325,12 +326,14 @@ class MiMoV2SWAAttention(MiMoV2Attention):
         hidden_states: torch.Tensor,
         rotary_pos_emb: tuple[torch.Tensor, torch.Tensor],
         state_cache: tuple[torch.Tensor, torch.Tensor],
-        swa_metadata: MiMoSWAAttentionMetadata,
+        swa_metadata: SWAStateRingMetadata,
     ) -> torch.Tensor:
         """Run varlen attention over chronological ring history + current
         KV."""
+        from lmdeploy.pytorch.backends.cuda.attention.swa_state_ring import swa_state_ring_attention
+
         query_states, key_states, value_states = self._project_qkv(hidden_states, rotary_pos_emb)
-        attn_output = mimo_swa_state_attention(
+        attn_output = swa_state_ring_attention(
             self.attn_fwd,
             query_states,
             key_states,
@@ -496,7 +499,7 @@ class MiMoV2DecoderLayer(nn.Module):
         caches: MiMoV2Caches,
         residual: torch.Tensor | None = None,
         attn_metadata: Any = None,
-        swa_metadata: MiMoSWAAttentionMetadata | None = None,
+        swa_metadata: SWAStateRingMetadata | None = None,
         all_routed_experts: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run pre-norm attention and FFN while carrying fused residual."""
@@ -619,7 +622,7 @@ class MiMoV2Model(nn.Module):
         position_ids: torch.LongTensor,
         caches: MiMoV2Caches,
         attn_metadata: Any = None,
-        swa_metadata: MiMoSWAAttentionMetadata | None = None,
+        swa_metadata: SWAStateRingMetadata | None = None,
         inputs_embeds: torch.Tensor | None = None,
         all_routed_experts: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -770,8 +773,10 @@ class MiMoV2FlashForCausalLM(nn.Module, DeployModelMixinV1, CudaGraphMixin):
         )
         swa_metadata = None
         if not use_paged_swa:
+            from lmdeploy.pytorch.backends.cuda.attention.swa_state_ring import SWAStateRingMetadata
+
             first_swa_ring = context.named_state_caches.layer('mimo_swa_ring_k', self._first_swa_layer)
-            swa_metadata = MiMoSWAAttentionMetadata.from_step_context(
+            swa_metadata = SWAStateRingMetadata.from_step_context(
                 attn_metadata,
                 context,
                 state_ids,
