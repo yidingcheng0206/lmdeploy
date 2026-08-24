@@ -458,6 +458,11 @@ class MiMoV2FlashMTPModel(DeepseekMTPModel):
         source_prefix = source_name.removesuffix('.weight_scale_inv').removesuffix('.weight')
         target_prefix = re.sub(r'\.(q|k|v)_proj$', '.qkv_proj', target_name.rsplit('.', 1)[0])
         target_param = params_dict[f'{target_prefix}.weight']
+        target_scale = params_dict.get(f'{target_prefix}.weight_scale_inv')
+        if target_scale is not None and target_param.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            target = target_scale if tensor_kind == 'scale' else target_param
+            load_weight(target, loaded_weight, shard_id=shard_id)
+            return
         buffer = self._load_buffers.setdefault(source_prefix, {})
         buffer[tensor_kind] = loaded_weight
         if set(buffer) != {'weight', 'scale'}:

@@ -55,20 +55,24 @@ def _reduce_tp_output(linear: nn.Module, output: torch.Tensor) -> torch.Tensor:
 
 
 def _dequantize_blocked_fp8(weight: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """Dequantize 2D FP8 using the checkpoint's serialized scale grid.
-
-    MiMo Full-K is (768, 4096) with an (8, 32) scale grid, so its effective output tile is 96 rather than the config-
-    level 128.  Deriving the tile from both tensors matches Transformers' official FP8 dequantization reference.
-    """
+    """Dequantize a 128x128 FP8 matrix, ignoring padded scale rows."""
     rows, columns = weight.shape
     scale_rows, scale_columns = scale.shape
-    if rows % scale_rows != 0 or columns % scale_columns != 0:
+    block_rows = block_columns = 128
+    required_scale_rows = (rows + block_rows - 1) // block_rows
+    required_scale_columns = (columns + block_columns - 1) // block_columns
+    if scale_rows < required_scale_rows or scale_columns < required_scale_columns:
         raise ValueError(
             f'Invalid blocked-FP8 weight/scale shapes: weight={tuple(weight.shape)}, scale={tuple(scale.shape)}.'
         )
-    weight = weight.reshape(scale_rows, rows // scale_rows, scale_columns, columns // scale_columns)
-    weight = weight.float() * scale.reshape(scale_rows, 1, scale_columns, 1).float()
-    return weight.to(dtype).reshape(rows, columns)
+    padded_rows = required_scale_rows * block_rows
+    padded_columns = required_scale_columns * block_columns
+    padded = torch.zeros((padded_rows, padded_columns), dtype=weight.dtype, device=weight.device)
+    padded[:rows, :columns] = weight
+    blocked = padded.reshape(required_scale_rows, block_rows, required_scale_columns, block_columns)
+    used_scale = scale[:required_scale_rows, :required_scale_columns]
+    blocked = blocked.float() * used_scale.reshape(required_scale_rows, 1, required_scale_columns, 1).float()
+    return blocked.reshape(padded_rows, padded_columns)[:rows, :columns].to(dtype)
 
 
 def _load_attention_sink(param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -143,11 +147,7 @@ class MiMoV2Attention(nn.Module):
             head_size=self.head_dim,
             head_size_v=self.v_head_dim,
             bias=config.attention_bias,
-            # P0 keeps QKV in BF16. A 192-wide local K head is not aligned to
-            # LMDeploy's 128-row packed-FP8 scale partitions at TP=4/8; the
-            # loader dequantizes the official FP8 Q/K/V tensors before the
-            # head-aware BF16 QKV loader shards or replicates them.
-            quant_config=None,
+            quant_config=quantization_config,
             dtype=dtype,
             device=device,
             num_replicate_kv_heads=num_replicate_kv_heads,
@@ -826,7 +826,7 @@ class MiMoV2FlashForCausalLM(nn.Module, DeployModelMixinV1, CudaGraphMixin):
         params_dict: dict[str, nn.Parameter],
         shard_id: str,
     ):
-        """Pair FP8 Q/K/V weights with scales, dequantize, then TP-shard."""
+        """Load native blocked-FP8 Q/K/V shards, with a dequant fallback."""
         if name.endswith('.weight_scale_inv'):
             source_prefix = name.removesuffix('.weight_scale_inv')
             tensor_kind = 'scale'
@@ -837,7 +837,17 @@ class MiMoV2FlashForCausalLM(nn.Module, DeployModelMixinV1, CudaGraphMixin):
             raise KeyError(f'Unexpected MiMo QKV tensor name: {name}')
 
         target_prefix = re.sub(r'\.(q|k|v)_proj$', '.qkv_proj', source_prefix)
+        target_suffix = name.rsplit('.', 1)[-1]
+        split_target = f'{target_prefix}.{shard_id}_proj.{target_suffix}'
+        if split_target in params_dict:
+            load_weight(params_dict[split_target], loaded_weight)
+            return
         target_param = params_dict[f'{target_prefix}.weight']
+        target_scale = params_dict.get(f'{target_prefix}.weight_scale_inv')
+        if target_scale is not None and target_param.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            target = target_scale if tensor_kind == 'scale' else target_param
+            load_weight(target, loaded_weight, shard_id=shard_id)
+            return
         if tensor_kind == 'weight' and loaded_weight.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
             load_weight(target_param, loaded_weight, shard_id=shard_id)
             return
