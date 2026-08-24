@@ -365,5 +365,5 @@ class QKVBlockedF8Linear(MergedBlockedF8Linear, QKVMixin):
         assert layout == 'default'
         qkv_split_section = self.qkv_split_section
         if loaded_weight.dim() == 2 and loaded_weight.dtype != self.fp8_dtype:
-            qkv_split_section = [sec // self.block_size for sec in qkv_split_section]
+            qkv_split_section = [div_up(sec, self.block_size) for sec in qkv_split_section]
         return loaded_weight.split(qkv_split_section, dim=0)

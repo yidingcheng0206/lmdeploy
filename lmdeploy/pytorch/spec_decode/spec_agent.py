@@ -60,6 +60,9 @@ def _set_warmup_block_offsets(inputs: ModelInputs, max_session_len: int,
         raise ValueError(
             f'Warmup session requires {num_blocks} KV blocks, but only {cache_config.num_gpu_blocks} are available.')
 
+    # Warmup rows contain the same dummy sequence, so they can model a shared
+    # prefix with one block table.  Runtime requests replace these offsets
+    # with scheduler-owned, per-sequence tables before graph replay.
     block_ids = torch.arange(
         num_blocks,
         dtype=inputs.block_offsets.dtype,

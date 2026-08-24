@@ -15,7 +15,8 @@ def test_reduce_scatter_by_tp_sizes_uses_disjoint_output(monkeypatch):
     def _reduce_scatter(output, inputs, group):
         seen['group'] = group
         seen['inputs'] = inputs
-        assert all(not torch._C._overlaps(output, item) for item in inputs)
+        output_storage = output.untyped_storage().data_ptr()
+        assert all(output_storage != item.untyped_storage().data_ptr() for item in inputs)
         output.copy_(inputs[0])
 
     monkeypatch.setattr(distributed.dist, 'reduce_scatter', _reduce_scatter)
@@ -26,4 +27,4 @@ def test_reduce_scatter_by_tp_sizes_uses_disjoint_output(monkeypatch):
     assert seen['group'] == 'test-group'
     assert len(seen['inputs']) == 4
     torch.testing.assert_close(result, source[:2])
-    assert not torch._C._overlaps(result, source)
+    assert result.untyped_storage().data_ptr() != source.untyped_storage().data_ptr()
