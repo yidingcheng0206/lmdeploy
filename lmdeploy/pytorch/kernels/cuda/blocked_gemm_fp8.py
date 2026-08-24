@@ -85,10 +85,10 @@ def _quant_fp8_kernel(
         if ROUND_SCALE == 1:
             scale = fast_round_scale(a_max, rfp8_max)
             rscale = 1 / scale
+            out = a.to(tl.float32) * rscale[:, None]
         else:
             scale = a_max * rfp8_max
-            rscale = fp8_max / a_max  # triton does not support rcp
-        out = a.to(tl.float32) * rscale[:, None]
+            out = a.to(tl.float32) / scale[:, None]
 
         out = tl.clamp(out, fp8_min, fp8_max)
         out = out.to(out_ptr.dtype.element_ty)

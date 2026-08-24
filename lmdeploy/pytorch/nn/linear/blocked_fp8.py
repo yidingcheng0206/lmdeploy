@@ -312,6 +312,10 @@ class QKVBlockedF8Linear(MergedBlockedF8Linear, QKVMixin):
                          out_names=out_names,
                          dp_gather=dp_gather,
                          layer_type='attn')
+        # Q/K/V scale grids are independently block-quantized in checkpoints.
+        # Keep a partial final block for each logical projection instead of
+        # flooring it away (for example, a 192-wide K shard needs two rows).
+        self.scale_split_section = [div_up(section, self.block_size) for section in self.all_out_features]
 
     def _update_all_out_features(self, all_out_features: list[int], replicate: list[bool] | None):
         """Update all out features."""
@@ -333,8 +337,8 @@ class QKVBlockedF8Linear(MergedBlockedF8Linear, QKVMixin):
         all_out_features = self.all_out_features
         if param._weight_type == 'scales':
             loaded_weight = loaded_weight.to(torch.float32)
-            all_out_features = [sec // self.block_size for sec in all_out_features]
-            sec_len = sec_len // self.block_size
+            all_out_features = [div_up(sec, self.block_size) for sec in all_out_features]
+            sec_len = div_up(sec_len, self.block_size)
 
         sec_start = rank_idx * sec_len
 
