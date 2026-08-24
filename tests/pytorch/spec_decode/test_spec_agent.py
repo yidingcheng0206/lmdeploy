@@ -5,10 +5,40 @@ import torch
 
 from lmdeploy.pytorch.model_inputs import DPMeta, ModelInputs
 from lmdeploy.pytorch.spec_decode.guided_spec_helper import GuidedSpecHelper
-from lmdeploy.pytorch.spec_decode.spec_agent import SpecModelAgent, _expand_sampling_inputs
+from lmdeploy.pytorch.spec_decode.spec_agent import (
+    SpecModelAgent,
+    _expand_sampling_inputs,
+    _is_cuda_graph_warmup_enabled,
+    _set_warmup_block_offsets,
+)
 from lmdeploy.pytorch.strategies.ar_spec.model_agent import ARSpecExtraInputs
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+
+def test_graph_warmup_is_disabled_for_eager_runner():
+    graph_runner = SimpleNamespace(backend_config=SimpleNamespace(eager_mode=True))
+    assert not _is_cuda_graph_warmup_enabled(graph_runner)
+
+
+def test_warmup_block_offsets_cover_session():
+    inputs = ModelInputs(
+        input_ids=torch.zeros((1, 6), dtype=torch.long),
+        seq_length=torch.full((2, ), 3, dtype=torch.long),
+        history_lengths=torch.zeros(2, dtype=torch.long),
+        block_offsets=torch.zeros((2, 1), dtype=torch.long),
+        is_decoding=True,
+        num_ignored_history=torch.zeros(2, dtype=torch.long),
+        max_q_seqlen=3,
+        max_kv_seqlen=3,
+        sum_kv_seqlen=6,
+    )
+    cache_config = SimpleNamespace(block_size=32, num_gpu_blocks=8)
+
+    result = _set_warmup_block_offsets(inputs, max_session_len=65, cache_config=cache_config)
+
+    assert result is inputs
+    assert torch.equal(inputs.block_offsets, torch.tensor([[0, 1, 2], [0, 1, 2]]))
 
 
 def _make_non_last_chunk_inputs(dp_meta=None):

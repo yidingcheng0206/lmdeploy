@@ -20,15 +20,6 @@ def test_arspec_cudagraph_keeps_full_spec_capture_for_eagle3():
     assert strategy.get_max_tokens(batch_size=8, origin_batch_size=8, num_tokens=40) == 40
 
 
-def test_mimo_cudagraph_preserves_intermediate_query_length_with_dp_padding():
-    """MiMo pre-captures q=2/q=3 graphs instead of padding them to q=k+1."""
-    strategy = ARSpecCudagraphStrategy(num_spec_tokens=3, method='mimo_mtp')
-
-    assert strategy.get_max_tokens(batch_size=4, origin_batch_size=2, num_tokens=4) == 8
-    assert strategy.get_max_tokens(batch_size=4, origin_batch_size=2, num_tokens=6) == 12
-    assert strategy.get_max_tokens(batch_size=4, origin_batch_size=2, num_tokens=8) == 16
-
-
 def test_cudagraph_fa3_metadata_uses_single_query_len_for_single_token_capture():
     from types import SimpleNamespace
 

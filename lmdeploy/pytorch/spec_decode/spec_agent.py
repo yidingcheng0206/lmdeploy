@@ -42,6 +42,33 @@ _GLOBAL_FIELDS = frozenset({
 })
 
 
+def _is_cuda_graph_warmup_enabled(graph_runner) -> bool:
+    """Return whether graph-only dummy input preparation is required."""
+    backend_config = getattr(graph_runner, 'backend_config', None)
+    return not bool(getattr(backend_config, 'eager_mode', False))
+
+
+def _set_warmup_block_offsets(inputs: ModelInputs, max_session_len: int,
+                              cache_config: CacheConfig) -> ModelInputs:
+    """Build a valid dummy block table for a warmup KV sequence."""
+    block_size = cache_config.block_size
+    if block_size <= 0:
+        raise ValueError(f'KV cache block size must be positive, got {block_size}.')
+
+    num_blocks = (max_session_len + block_size - 1) // block_size
+    if num_blocks > cache_config.num_gpu_blocks:
+        raise ValueError(
+            f'Warmup session requires {num_blocks} KV blocks, but only {cache_config.num_gpu_blocks} are available.')
+
+    block_ids = torch.arange(
+        num_blocks,
+        dtype=inputs.block_offsets.dtype,
+        device=inputs.block_offsets.device,
+    )
+    inputs.block_offsets = block_ids.expand(inputs.seq_length.numel(), -1).contiguous()
+    return inputs
+
+
 def _expand_sampling_inputs(sampling_inputs: SamplingInputs, num_tokens: int) -> SamplingInputs:
     """Expand per-batch SamplingInputs to per-token by repeating each batch
     element num_tokens times via repeat_interleave.
@@ -740,6 +767,7 @@ class SpecModelAgent(BaseSpecModelAgent):
 
             capture_batch_sizes = self.proposer.model.get_capture_batch_sizes()
             capture_batch_sizes = sorted(capture_batch_sizes, reverse=True)
+            graph_warmup_enabled = _is_cuda_graph_warmup_enabled(self.proposer.model)
 
             # warmup decode
             for batch_size in capture_batch_sizes:
@@ -767,7 +795,7 @@ class SpecModelAgent(BaseSpecModelAgent):
                         'prepare_cudagraph_warmup_inputs',
                         None,
                     )
-                    if prepare_warmup is not None:
+                    if prepare_warmup is not None and graph_warmup_enabled:
                         max_session_len = self.specdecode_config.max_session_len
                         # ``--session-len`` is optional.  At this point cache
                         # sizing has completed, so its usable capacity is the
@@ -786,6 +814,7 @@ class SpecModelAgent(BaseSpecModelAgent):
                             raise ValueError(
                                 f'Speculative CUDA Graph query length {query_len} exceeds the maximum session '
                                 f'length {max_session_len}.')
+                        inputs = _set_warmup_block_offsets(inputs, max_session_len, self.cache_config)
                         inputs = prepare_warmup(
                             inputs,
                             max_history_len=max_session_len - query_len,
