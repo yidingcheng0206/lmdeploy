@@ -893,6 +893,12 @@ def flash_attn_with_kvcache(
 
     is_fp8_scalar = quant_policy in (QuantPolicy.FP8, QuantPolicy.FP8_E5M2)
     SPLIT_K = _get_split_k(q.device.index, grid_1, batch, num_warps)
+    # Triton's reduction over 128 split rows is numerically incorrect for a
+    # 128-wide value tile on current CUDA builds.  This can silently corrupt
+    # long-context decode on high-SM GPUs, where the occupancy heuristic may
+    # select SPLIT_K=128.  A 64-way reduction is stable for the same inputs.
+    if BLOCK_DV == 128:
+        SPLIT_K = min(SPLIT_K, 64)
 
     if quant_policy == QuantPolicy.INT4 or quant_policy == QuantPolicy.TURBO_QUANT:
         acc = q.new_empty(num_tokens, head, SPLIT_K, o.shape[-1] + 2, dtype=torch.float32)

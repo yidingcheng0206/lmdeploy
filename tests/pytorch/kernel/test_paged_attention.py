@@ -315,6 +315,32 @@ class TestPagedAttention(TestPagedAttentionBase):
                                       kv_layout=layout)
         torch.testing.assert_close(out, conti_gt, atol=1e-3, rtol=1e-5)
 
+    @pytest.mark.parametrize('feat_dim', [192], indirect=True)
+    @pytest.mark.parametrize('feat_dim_v', [128], indirect=True)
+    @pytest.mark.parametrize(['num_heads_q', 'num_heads_k'], [(16, 1)], indirect=True)
+    @pytest.mark.parametrize('history_lens', [(1370, )], indirect=True)
+    @pytest.mark.parametrize('block_size', [64], indirect=True)
+    @pytest.mark.parametrize('layout', ['bshd'], indirect=True)
+    def test_split_k_128_value_dim_128(self, monkeypatch, conti_q, blocked_kv,
+                                      block_offsets, kv_seqlens, layout,
+                                      conti_gt):
+        """A 128-way split must not corrupt a 128-wide value reduction."""
+        if type(self) is not TestPagedAttention:
+            pytest.skip('This regression covers the unquantized kernel.')
+        from lmdeploy.pytorch.kernels.cuda import pagedattention
+
+        monkeypatch.setattr(pagedattention, '_get_split_k', lambda *args: 128)
+        blocked_k, blocked_v = blocked_kv
+        out = pagedattention.flash_attn_with_kvcache(
+            conti_q,
+            blocked_k,
+            blocked_v,
+            page_table=block_offsets,
+            cache_seqlens=kv_seqlens,
+            kv_layout=layout,
+        )
+        torch.testing.assert_close(out, conti_gt, atol=1e-3, rtol=1e-5)
+
     @pytest.fixture
     def win_size(self, request):
         yield request.param
