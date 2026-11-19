@@ -21,30 +21,44 @@ class DeviceCommunicator:
 
     def all_gather(self, input: torch.Tensor, *, dim: int = -1,
                    workspace=None, copy_output: bool = True) -> torch.Tensor:
-        """Gather 2D inputs along dimension 0 or -1 on every group rank.
+        """Gather 2D payloads without changing their dtype or bits.
 
-        With copy_output=False, optimized output may borrow the workspace until its next use. Consume it on the same
-        stream. Native gathering always returns an owned output for multi-rank groups.
+        Native multi-rank outputs own their storage. An optimized provider may
+        borrow its workspace only with copy_output=False; the caller must then
+        finish consuming it on the same execution stream before reuse. Input
+        shapes, including empty batches, must agree within this process group.
         """
-        if input.dim() != 2 or dim not in (0, -1):
+        if input.ndim != 2 or dim not in (0, -1):
             raise ValueError('all_gather requires a 2D input and dim=0 or dim=-1')
-        world_size = dist.get_world_size(self.device_group)
-        if world_size == 1:
+        size = dist.get_world_size(self.device_group)
+        if size == 1:
             return input
         input = input.contiguous()
-        gathered = input.new_empty(world_size * input.size(0), input.size(1))
-        dist.all_gather_into_tensor(gathered, input, group=self.device_group)
+        gathered = input.new_empty(size * input.size(0), input.size(1))
+        if input.numel():
+            dist.all_gather_into_tensor(gathered, input, group=self.device_group)
         if dim == 0:
             return gathered
-        return gathered.view(world_size, *input.shape).transpose(0, 1).reshape(input.size(0), -1)
+        return gathered.view(size, *input.shape).transpose(0, 1).reshape(input.size(0), size * input.size(1))
 
     def create_all_gather_workspace(self, gathered_width: int, device: torch.device, dtype: torch.dtype,
-                                    *, dim: int = -1, reuse_sync: bool = True, capacity_bytes: int = 64 * 1024 * 1024):
-        """Create a caller-owned workspace.
+                                    *, dim: int = -1, reuse_sync: bool = True,
+                                    capacity_bytes: int = 64 * 1024 * 1024):
+        """Prepare an optional caller-owned provider outside graph capture.
 
-        Disable reuse_sync only when a subsequent same-group collective orders all consumers before the next gather.
+        Native collectives need no persistent gather workspace. Providers must
+        agree on eligibility across this group before optional rendezvous, and
+        protect previous readers before reusing borrowed storage.
         """
         return None
+
+    def all_to_all_single(self, output: torch.Tensor, input: torch.Tensor):
+        """Exchange equally sized rank chunks on this communicator's group."""
+        dist.all_to_all_single(output, input, group=self.device_group)
+
+    def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
+        """Sum and scatter rank chunks on this communicator's group."""
+        dist.reduce_scatter_tensor(output, input, group=self.device_group)
 
     def close(self):
         """Release group-owned resources; gather workspaces belong to

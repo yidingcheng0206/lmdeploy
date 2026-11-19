@@ -13,8 +13,8 @@ from lmdeploy.pytorch.backends.cp_utils import (
 )
 from lmdeploy.utils import get_logger
 
+from ..dcp import get_dcp_manager
 from ..step_metadata import CudaAttentionMetaBuilder
-from .cp import get_dcp_manager
 from .default import TritonAttentionImpl, TritonAttentionMetadata
 
 logger = get_logger('lmdeploy')
@@ -253,6 +253,10 @@ class FlashMLAImpl(TritonAttentionImpl):
         self.flatten_kv_cache_mla_fp8 = flatten_kv_cache_mla_fp8
         assert num_kv_heads == 1, 'MLA requires num kv heads equal to 1'
         self.use_fa3 = use_fa3
+        if self.dcp_world_size > 1:
+            self.dcp_manager = get_dcp_manager()
+            self.dcp_manager.prepare_attention(self.num_heads, self.head_size)
+            self.dcp_manager.prepare_prefix_gather(self.head_size)
 
         if self.dcp_world_size > 1:
             self.dcp_manager = get_dcp_manager()
@@ -524,9 +528,11 @@ class FlashMLAImpl(TritonAttentionImpl):
         v_scales_zeros: torch.Tensor = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Gather one globally ordered cached-prefix chunk."""
+        dcp_world_size = self.dcp_world_size
+        block_size = k_cache.size(1)
         local_meta = replace(
             attn_metadata,
-            block_offsets=attn_metadata.block_offsets[:, chunk.local_block_slice(k_cache.size(1))],
+            block_offsets=attn_metadata.block_offsets[:, chunk.local_block_slice(block_size)],
             kv_start_loc=chunk.local_cu_seqlens[:-1],
             kv_seqlens=chunk.local_kv_seqlens[self.dcp_rank],
             cu_seqlens_k=chunk.local_cu_seqlens,
@@ -738,12 +744,20 @@ class FlashMLAImpl(TritonAttentionImpl):
         )
         return flatten_k
 
+    def _prepare_dcp_query(self, query: torch.Tensor, query_is_dcp_replicated: bool) -> torch.Tensor:
+        if query_is_dcp_replicated:
+            if self.dcp_world_size <= 1 or query.size(1) != self.num_heads * self.dcp_world_size:
+                raise ValueError('Replicated DCP query heads must match local_heads * dcp')
+            return query
+        return self.dcp_manager.gather_query(query)
+
     def _forward_decoding(
         self,
         query: torch.Tensor,
         k_cache: torch.Tensor,
         attn_metadata: TritonAttentionMetadata,
         nsa_indices: torch.Tensor = None,
+        query_is_dcp_replicated: bool = False,
     ) -> torch.Tensor:
         """Forward pass for dense MLA decoding.
 
@@ -761,7 +775,7 @@ class FlashMLAImpl(TritonAttentionImpl):
         if self.dcp_world_size == 1:
             return self._decoding_paged(query, k_cache, attn_metadata)
 
-        query = self.dcp_manager.gather_query(query)
+        query = self._prepare_dcp_query(query, query_is_dcp_replicated)
         query_len = query.size(0) // attn_metadata.q_seqlens.numel()
         if query_len > 1:
             # Consecutive global queries do not advance each interleaved
@@ -852,6 +866,7 @@ class FlashMLAImpl(TritonAttentionImpl):
         k_scales_zeros: torch.Tensor = None,
         v_scales_zeros: torch.Tensor = None,
         nsa_indices: torch.Tensor = None,
+        query_is_dcp_replicated: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         """Forward pass for dense MLA attention.
@@ -878,6 +893,9 @@ class FlashMLAImpl(TritonAttentionImpl):
         Returns:
             Attention output tensor.
         """
+        if query_is_dcp_replicated and (not attn_metadata.is_decoding or self.dcp_world_size <= 1):
+            raise ValueError('Replicated DCP queries require decode with dcp > 1')
+
         # Shared preparation
         max_q_seqlen = self._get_max_q_seqlen(query, attn_metadata)
 
@@ -895,6 +913,11 @@ class FlashMLAImpl(TritonAttentionImpl):
 
         # Dispatch to stage-specific forward method
         if attn_metadata.is_decoding:
+            # Keep the default call compatible with TileLang's decode override,
+            # which does not accept replicated DCP queries.
+            if query_is_dcp_replicated:
+                return self._forward_decoding(query, k_cache, attn_metadata, nsa_indices,
+                                               query_is_dcp_replicated=True)
             return self._forward_decoding(query, k_cache, attn_metadata, nsa_indices)
         else:
             return self._forward_prefill(

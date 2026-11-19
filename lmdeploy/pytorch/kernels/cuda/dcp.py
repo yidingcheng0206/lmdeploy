@@ -7,6 +7,106 @@ import triton.language as tl
 
 
 @triton.jit
+def _pack_dcp_attention_kernel(
+    LocalOutput, LocalLse, ValidCounts, Packed,
+    stride_ot, stride_oh, stride_od, stride_lt, stride_lh, stride_c,
+    TOKENS: tl.constexpr, LOCAL_HEADS: tl.constexpr, HEAD_DIM: tl.constexpr,
+    WORDS: tl.constexpr, ELEMENTS_PER_WORD: tl.constexpr, BLOCK_D: tl.constexpr,
+):
+    token = tl.program_id(0)
+    head = tl.program_id(1)
+    destination = head // LOCAL_HEADS
+    row = (destination * TOKENS + token) * LOCAL_HEADS + head % LOCAL_HEADS
+    lse = tl.load(LocalLse + token * stride_lt + head * stride_lh).to(tl.float32)
+    valid = (tl.load(ValidCounts + token * stride_c) > 0) & (lse == lse) & (lse != float('inf'))
+    lse = tl.where(valid, lse, -float('inf'))
+    dims = tl.arange(0, BLOCK_D)
+    values = tl.load(LocalOutput + token * stride_ot + head * stride_oh + dims * stride_od,
+                     mask=dims < HEAD_DIM, other=0)
+    values = tl.where(lse == -float('inf'), 0., values)
+    # A row contains raw O bytes (padded to a 32-bit boundary), then one
+    # FP32 LSE word. Do not numerically cast LSE to the output dtype.
+    values_ptr = Packed.to(tl.pointer_type(LocalOutput.dtype.element_ty))
+    tl.store(values_ptr + row * WORDS * ELEMENTS_PER_WORD + dims, values,
+             mask=dims < (WORDS - 1) * ELEMENTS_PER_WORD)
+    tl.store(Packed.to(tl.pointer_type(tl.float32)) + row * WORDS + WORDS - 1, lse)
+
+
+@triton.jit
+def _combine_dcp_attention_kernel(
+    Received, Output, TOKENS: tl.constexpr, LOCAL_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr, WORDS: tl.constexpr, ELEMENTS_PER_WORD: tl.constexpr,
+    DCP_SIZE: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
+):
+    token = tl.program_id(0)
+    head = tl.program_id(1)
+    ranks = tl.arange(0, BLOCK_N)
+    rows = (ranks * TOKENS + token) * LOCAL_HEADS + head
+    lse = tl.load(Received.to(tl.pointer_type(tl.float32)) + rows * WORDS + WORDS - 1,
+                  mask=ranks < DCP_SIZE, other=-float('inf'))
+    maximum = tl.max(lse, axis=0)
+    safe_maximum = tl.where(maximum == -float('inf'), 0., maximum)
+    exponent = tl.exp(lse - safe_maximum)
+    denominator = tl.sum(exponent, axis=0)
+    weights = tl.where(denominator > 0., exponent / denominator, 0.)
+    dims = tl.arange(0, BLOCK_D)
+    values_ptr = Received.to(tl.pointer_type(Output.dtype.element_ty))
+    values = tl.load(values_ptr + rows[:, None] * WORDS * ELEMENTS_PER_WORD + dims[None, :],
+                     mask=(ranks[:, None] < DCP_SIZE) & (dims[None, :] < HEAD_DIM), other=0).to(tl.float32)
+    contributions = tl.where(weights[:, None] == 0., 0., values * weights[:, None])
+    output = tl.sum(contributions, axis=0)
+    tl.store(Output + (token * LOCAL_HEADS + head) * HEAD_DIM + dims, output, mask=dims < HEAD_DIM)
+
+
+def dcp_attention_packet_shape(local_output: torch.Tensor, dcp_world_size: int) -> tuple[int, ...]:
+    """INT32 wire layout: [destination/source, tokens, local heads, words]."""
+    assert local_output.ndim == 3
+    assert local_output.dtype in (torch.float16, torch.bfloat16, torch.float32)
+    tokens, heads, head_dim = local_output.shape
+    assert dcp_world_size >= 1 and heads % dcp_world_size == 0
+    words = triton.cdiv(head_dim * local_output.element_size(), 4) + 1
+    return dcp_world_size, tokens, heads // dcp_world_size, words
+
+
+def pack_dcp_attention(local_output: torch.Tensor, local_lse: torch.Tensor,
+                       valid_counts: torch.Tensor, *, dcp_world_size: int,
+                       out: torch.Tensor | None = None) -> torch.Tensor:
+    """Sanitize and pack outputs/LSE for a single head-scattering all-to-all."""
+    shape = dcp_attention_packet_shape(local_output, dcp_world_size)
+    assert local_lse.shape == local_output.shape[:2]
+    assert valid_counts.shape == local_output.shape[:1]
+    if out is None:
+        out = torch.empty(shape, dtype=torch.int32, device=local_output.device)
+    assert out.shape == shape and out.dtype == torch.int32 and out.is_contiguous()
+    if shape[1] == 0:
+        return out
+    elements_per_word = 4 // local_output.element_size()
+    _pack_dcp_attention_kernel[local_output.shape[:2]](
+        local_output, local_lse, valid_counts, out,
+        *local_output.stride(), *local_lse.stride(), valid_counts.stride(0),
+        TOKENS=shape[1], LOCAL_HEADS=shape[2], HEAD_DIM=local_output.size(2),
+        WORDS=shape[3], ELEMENTS_PER_WORD=elements_per_word,
+        BLOCK_D=triton.next_power_of_2((shape[3] - 1) * elements_per_word), num_warps=4)
+    return out
+
+
+def combine_dcp_attention(received: torch.Tensor, *, head_dim: int, dtype: torch.dtype) -> torch.Tensor:
+    """Merge received shard states in FP32; all-empty rows produce zero."""
+    assert received.ndim == 4 and received.dtype == torch.int32 and received.is_contiguous()
+    assert dtype in (torch.float16, torch.bfloat16, torch.float32)
+    dcp_size, tokens, local_heads, words = received.shape
+    output = torch.empty((tokens, local_heads, head_dim), dtype=dtype, device=received.device)
+    assert words == triton.cdiv(head_dim * output.element_size(), 4) + 1
+    if tokens == 0:
+        return output
+    _combine_dcp_attention_kernel[(tokens, local_heads)](
+        received, output, TOKENS=tokens, LOCAL_HEADS=local_heads, HEAD_DIM=head_dim,
+        WORDS=words, ELEMENTS_PER_WORD=4 // output.element_size(), DCP_SIZE=dcp_size,
+        BLOCK_N=triton.next_power_of_2(dcp_size), BLOCK_D=triton.next_power_of_2(head_dim), num_warps=4)
+    return output
+
+
+@triton.jit
 def _filter_and_compact_dcp_indices_kernel(
     Indices,
     Output,

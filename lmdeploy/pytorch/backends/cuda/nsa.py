@@ -375,6 +375,10 @@ class TritonNSAIndexFP8Impl(NSAIndexFP8Impl):
         self.dcp_world_size, self.dcp_rank = get_dcp_world_rank()
         self._sparse_index_topk = _get_sparse_index_topk(topk)
         if self.dcp_world_size > 1:
+            from .dcp import get_dcp_manager
+
+            self.dcp_manager = get_dcp_manager()
+            self.dcp_manager.prepare_candidate_gather(topk)
             if self._sparse_index_topk is None:
                 raise RuntimeError('DCP requires the TileLang sparse index top-k kernel.')
             if _get_deep_gemm() is None:

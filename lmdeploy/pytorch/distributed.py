@@ -14,7 +14,7 @@ from .config import DistConfig, TPMode
 
 if TYPE_CHECKING:
     from .backends.communicator import DeviceCommunicator
-    from .backends.cuda.attention.cp import DCPManager
+    from .backends.cuda.dcp import DCPManager
 
 
 @dataclass
@@ -527,6 +527,13 @@ def reduce_scatter_tensor(output, input, op=ReduceOp.SUM, group='tp', async_op=F
     if isinstance(group, str):
         group = get_group(group, 'gpu')
     return dist.reduce_scatter_tensor(output, input, op=op, group=group, async_op=async_op)
+
+
+def all_to_all_single(output, input, group='tp', async_op=False):
+    """Exchange equal-sized rank-major chunks."""
+    if isinstance(group, str):
+        group = get_group(group, 'gpu')
+    return dist.all_to_all_single(output, input, group=group, async_op=async_op)
 
 
 def gather_by_tp_sizes(x: torch.Tensor,

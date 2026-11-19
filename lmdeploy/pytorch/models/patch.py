@@ -208,6 +208,10 @@ def build_model_from_hf_config(model_config: PretrainedConfig,
     if device is None:
         device = torch.device('cuda')
     model_cls = _get_model_class(model_config, module_map)
+    from lmdeploy.pytorch.distributed import get_dist_manager
+    if (get_dist_manager().current_config().dcp_replicate_q_proj
+            and not model_cls.__dict__.get('supports_dcp_q_replication', False)):
+        raise ValueError(f'{model_cls.__name__} does not support DCP query projection replication')
     if getattr(model_config, '_lmdeploy_task', None) == 'intern-decision':
         from .intern_decision import InternDecisionForConditionalGeneration
         from .qwen3_5 import Qwen3_5ForConditionalGeneration

@@ -521,6 +521,11 @@ def test_dcp_cached_prefill_matches_reference_across_chunks(monkeypatch, sparse,
     else:
         assert metadata.dcp_prefill_request_ids is None
     impl_cls = FlashMLASparseImpl if sparse else mla_module.FlashMLAImpl
+    from lmdeploy.pytorch.backends.cuda.dcp import DCPManager
+    communicator = Mock()
+    communicator.create_all_gather_workspace.return_value = None
+    manager = DCPManager(SimpleNamespace(gpu_group=object(), rank=0, communicator=communicator), dcp_size)
+    monkeypatch.setattr(mla_module, 'get_dcp_manager', lambda: manager)
     kwargs = dict(mla_index_topk=512) if sparse else {}
     impl = impl_cls(num_heads=8,
                     head_size=576,

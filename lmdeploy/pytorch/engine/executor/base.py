@@ -323,6 +323,7 @@ class ExecutorBase:
             dcp_size=config.dcp,
             topk=model.mla_index_topk,
             score_workspace_bytes=self._get_dsa_score_workspace_size(),
+            comm_backend=self.dist_config.dcp_comm_backend,
             kv_width=get_dcp_kv_width(model),
         )
 

@@ -73,10 +73,17 @@ class CudaCommunicator(DeviceCommunicator):
 def build_cuda_communicator(cpu_group: dist.ProcessGroup, device_group: dist.ProcessGroup,
                             dist_config, *, group_name: Literal['tp', 'dcp'] = 'tp'):
     """Agree on configuration and topology before optional collective setup."""
-    backend = dist_config.communication_backend
     compatible = dist_config.dp == 1 and dist_config.ep == 1 and not dist_config.enable_microbatch
+    if group_name == 'dcp' and not compatible:
+        # DCP still needs a communicator for native collectives when the TP
+        # symmetric-memory provider is disabled by DP/EP topology.
+        return DeviceCommunicator(device_group=device_group)
+    if group_name not in ('tp', 'dcp'):
+        raise ValueError(f'Unknown communicator group: {group_name}')
     if not compatible:
         return None
+
+    backend = getattr(dist_config, 'communication_backend', 'nccl')
 
     device = torch.cuda.current_device()
     local = (backend, group_name, socket.gethostname(), device,

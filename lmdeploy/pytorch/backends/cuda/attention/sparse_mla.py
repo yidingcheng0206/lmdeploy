@@ -342,7 +342,8 @@ class FlashMLASparseImpl(FlashMLAImpl):
                           query: torch.Tensor,
                           k_cache: torch.Tensor,
                           attn_metadata: TritonAttentionMetadata,
-                          nsa_indices: torch.Tensor = None) -> torch.Tensor:
+                          nsa_indices: torch.Tensor = None,
+                          query_is_dcp_replicated: bool = False) -> torch.Tensor:
         """Forward pass for sparse MLA decoding."""
         if nsa_indices is None:
             raise RuntimeError('Sparse MLA requires DSA top-k indices.')
@@ -352,7 +353,7 @@ class FlashMLASparseImpl(FlashMLAImpl):
             dcp_world_rank = self.dcp_world_size, self.dcp_rank
             local_indices, local_counts = filter_and_compact_dcp_indices(
                 nsa_indices, dcp_world_rank=dcp_world_rank)
-            query = self.dcp_manager.gather_query(query)
+            query = self._prepare_dcp_query(query, query_is_dcp_replicated)
             local_output, local_lse = self._decoding_sparse(
                 query, k_cache, local_indices, attn_metadata,
                 return_lse=True, topk_length=local_counts)
