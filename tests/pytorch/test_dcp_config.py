@@ -8,7 +8,7 @@ import torch
 
 from lmdeploy import PytorchEngineConfig
 from lmdeploy.cli.utils import ArgumentHelper
-from lmdeploy.pytorch.config import DistConfig
+from lmdeploy.pytorch.config import DistConfig, TPMode
 
 
 @pytest.mark.parametrize('backend', ['ag_rs', 'a2a'])
@@ -42,6 +42,34 @@ def test_dcp_divisibility_uses_resolved_attention_tp():
         DistConfig.from_engine_config(engine)
     with pytest.raises(AssertionError, match='attn_tp 2 must be divisible by dcp 4'):
         DistConfig(tp=8, dp=4, ep=8, dcp=4)
+
+
+@pytest.mark.parametrize(
+    ('kwargs', 'expected'),
+    [
+        ({'tp': 8, 'dp': 2, 'ep': 8, 'dcp': 2},
+         {'world_size': 8, 'attn_tp': 4, 'mlp_tp': 8, 'moe_tp': 1}),
+        ({'tp': 8, 'dp': 2, 'ep': 8, 'dcp': 4},
+         {'world_size': 8, 'attn_tp': 4, 'mlp_tp': 8, 'moe_tp': 1}),
+        ({'tp': 4, 'dp': 2, 'ep': 4, 'dcp': 2},
+         {'world_size': 4, 'attn_tp': 2, 'mlp_tp': 4, 'moe_tp': 1}),
+    ])
+def test_dcp_dp_ep_topology_resolves_expected_attention_groups(kwargs, expected):
+    config = DistConfig(**kwargs)
+    for field, value in expected.items():
+        assert getattr(config, field) == value
+    assert config.attn_tp % config.dcp == 0
+    assert config.world_size % config.dp == 0
+    assert config.world_size % config.ep == 0
+    assert config.world_size % config.mlp_tp == 0
+    assert config.world_size % config.moe_tp == 0
+
+
+def test_dcp_dp_ep_layer_tp_modes_are_explicit():
+    config = DistConfig(tp=8, dp=2, ep=8, dcp=4)
+    assert config.get_tp_by_layer('attn') == (4, TPMode.DEFAULT)
+    assert config.get_tp_by_layer('mlp') == (8, TPMode.DP_TP)
+    assert config.get_tp_by_layer('moe') == (1, TPMode.DEFAULT)
 
 
 def test_q_replication_rejects_quantized_or_lora_projection(monkeypatch):

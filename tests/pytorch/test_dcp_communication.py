@@ -7,6 +7,16 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 
+def _group_members(group):
+    """Collect global ranks in a CUDA process group for topology assertions."""
+    size = dist.get_world_size(group=group)
+    rank = dist.get_rank()
+    value = torch.tensor([rank], dtype=torch.int32, device='cuda')
+    values = [torch.empty_like(value) for _ in range(size)]
+    dist.all_gather(values, value, group=group)
+    return sorted(int(item.item()) for item in values)
+
+
 def _dcp_worker(rank, rendezvous, world_size):
     from lmdeploy.pytorch.backends.cuda.attention.cp import (
         gather_dcp_query,
@@ -26,6 +36,18 @@ def _dcp_worker(rank, rendezvous, world_size):
         for dcp in ((1, 2, 4) if world_size == 8 else (1, 2)):
             config = DistConfig(tp=world_size, dp=dp, ep=world_size, dp_rank=rank // attn_tp, dcp=dcp)
             context = DistContext.build(rank, config, communicator_builder=lambda **kwargs: None)
+            assert context.attn_tp_group.rank == rank % attn_tp
+            if context.ep_gpu_group is not None:
+                assert len(_group_members(context.ep_gpu_group)) == config.ep
+            if dcp > 1:
+                attn_members = _group_members(context.attn_tp_group.gpu_group)
+                dcp_members = _group_members(context.dcp_group.gpu_group)
+                expected_attn = list(range(rank // attn_tp * attn_tp, (rank // attn_tp + 1) * attn_tp))
+                expected_dcp = list(range(rank // dcp * dcp, (rank // dcp + 1) * dcp))
+                assert attn_members == expected_attn
+                assert dcp_members == expected_dcp
+                assert set(dcp_members).issubset(attn_members)
+                assert context.dcp_group.rank == rank % dcp
             with get_dist_manager().context(context), torch.inference_mode(), torch.cuda.stream(torch.cuda.Stream()):
                 tokens = 3 if rank < attn_tp else 7  # Different batches across DP groups.
                 torch.manual_seed(717 + rank // dcp)
