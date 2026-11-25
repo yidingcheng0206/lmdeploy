@@ -301,6 +301,7 @@ def _fwd_grouped_split_quant_kernel(
     stride_od: tl.constexpr,
     stride_boffb,
     kv_group_num: tl.constexpr,
+    seq_len: tl.constexpr,
     window_size: tl.constexpr,
     head_size: tl.constexpr,
     head_size_v: tl.constexpr,
@@ -336,6 +337,19 @@ def _fwd_grouped_split_quant_kernel(
     if BLOCK_H < kv_group_num:
         cur_kv_head = (cur_kv_head * HEAD_PER_CTA) // kv_group_num
 
+    if seq_len > 1:
+        # Pack query positions and their GQA heads into the same matrix tile.
+        # K/V stay shared; each packed row retains its own causal boundary.
+        HEADS_PER_REQ: tl.constexpr = kv_group_num * seq_len
+        TILES_PER_GROUP: tl.constexpr = tl.cdiv(HEADS_PER_REQ, BLOCK_H)
+        subtile_id = tl.program_id(0) % TILES_PER_GROUP
+        cur_kv_head = tl.program_id(0) // TILES_PER_GROUP
+        packed_row = subtile_id * BLOCK_H + tl.arange(0, BLOCK_H)
+        query_index = packed_row // kv_group_num
+        cur_head = cur_kv_head * kv_group_num + packed_row % kv_group_num
+        mask_h = (query_index < seq_len) & (cur_head < num_heads_q)
+        cur_token = cur_batch * seq_len + query_index
+
     q_seqlen = 1
     kv_seqlen = tl.load(cache_seqlens_ptr + cur_batch)
     if kv_seqlen <= 0:
@@ -360,7 +374,10 @@ def _fwd_grouped_split_quant_kernel(
     off_ksz = (cur_kv_head * stride_kszh + offs_dsz[:, None] * stride_kszd + offs_n[None, :] * stride_kszbs)
     off_vsz = (cur_kv_head * stride_vszh + offs_dsz[None, :] * stride_vszd + offs_n[:, None] * stride_vszbs)
 
-    off_q = (cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_d[None, :] * stride_qd)
+    if seq_len > 1:
+        off_q = (cur_token[:, None] * stride_qbs + cur_head[:, None] * stride_qh + offs_d[None, :] * stride_qd)
+    else:
+        off_q = (cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_d[None, :] * stride_qd)
     q = tl.load(q_ptr + off_q, mask=mask_h[:, None] & mask_d[None, :], other=0)
 
     ksz_ptrs = KScalesZeros + off_ksz
@@ -370,7 +387,10 @@ def _fwd_grouped_split_quant_kernel(
         offs_d1 = BLOCK_DMODEL + tl.arange(0, BLOCK_DMODEL1)
         mask_d1 = offs_d1 < head_size
         offs_d1 = offs_d1 % head_size
-        off_q1 = (cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_d1[None, :] * stride_qd)
+        if seq_len > 1:
+            off_q1 = (cur_token[:, None] * stride_qbs + cur_head[:, None] * stride_qh + offs_d1[None, :] * stride_qd)
+        else:
+            off_q1 = (cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_d1[None, :] * stride_qd)
         q1 = tl.load(q_ptr + off_q1, mask=mask_h[:, None] & mask_d1[None, :], other=0)
         off_k1 = (cur_kv_head * stride_kh + offs_d1[:, None] * stride_kd + offs_n[None, :] * stride_kbs)
 
@@ -433,8 +453,12 @@ def _fwd_grouped_split_quant_kernel(
     # dirty
     start_block_id = loop_start // BLOCK_N
     if window_size > 0:
-        start_block_id = tl.maximum(history_len - window_size, loop_start) // BLOCK_N
-        kv_min_loc = tl.maximum(history_len - window_size, 0)
+        if seq_len > 1:
+            first_query_pos = kv_seqlen - seq_len + subtile_id * BLOCK_H // kv_group_num
+            start_block_id = tl.maximum(first_query_pos - window_size, loop_start) // BLOCK_N
+        else:
+            start_block_id = tl.maximum(history_len - window_size, loop_start) // BLOCK_N
+            kv_min_loc = tl.maximum(history_len - window_size, 0)
 
     loop_start = start_block_id * BLOCK_N
     for start_n in range(loop_start, loop_end, BLOCK_N):
@@ -516,7 +540,13 @@ def _fwd_grouped_split_quant_kernel(
             qk = qk * logit_softcapping
         qk = qk * tl_log2(math.e)
         # NOTE: inf - inf = nan, and nan will leads to error
-        if start_n + BLOCK_N > history_len or window_size > 0:
+        if seq_len > 1:
+            query_pos = kv_seqlen - seq_len + query_index
+            qk_mask = (start_n + offs_n[None, :]) <= query_pos[:, None]
+            if window_size > 0:
+                qk_mask &= (start_n + offs_n[None, :]) >= (query_pos[:, None] - window_size)
+            qk = tl.where(qk_mask, qk, -float('inf'))
+        elif start_n + BLOCK_N > history_len or window_size > 0:
             qk_mask = history_len >= (start_n + offs_n)
             if window_size > 0:
                 qk_mask = qk_mask & ((start_n + offs_n) >= kv_min_loc)
@@ -527,12 +557,19 @@ def _fwd_grouped_split_quant_kernel(
             )
 
         if alibi_slopes_ptr is not None:
-            relative_pos = kv_seqlen - start_n - offs_n[None, :]
+            if seq_len > 1:
+                relative_pos = query_pos[:, None] + 1 - start_n - offs_n[None, :]
+            else:
+                relative_pos = kv_seqlen - start_n - offs_n[None, :]
             bias = -tl.abs(relative_pos).to(tl.float32) * alibi_slopes[:, None]
             qk += bias
 
         # -- compute p, m_i and l_i
         m_i_new = tl.maximum(m_i, tl.max(qk, 1))
+        if seq_len > 1:
+            # A KV split may contain only future tokens for an earlier query.
+            # Keep its zero partial sum finite instead of evaluating -inf - -inf.
+            m_i_new = tl.maximum(m_i_new, -1.0e30)
         p = tl_exp2(qk - m_i_new[:, None])
         alpha = tl_exp2(m_i - m_i_new)
         l_i_new = alpha * l_i + tl.sum(p, 1)
@@ -557,14 +594,20 @@ def _fwd_grouped_split_quant_kernel(
 
     # initialize pointers to output
     if loop_end > loop_start:
-        off_acc = (cur_batch * stride_obs + split_k_id * stride_ok + cur_head[:, None] * stride_oh +
-                   offs_dv[None, :] * stride_od)
+        if seq_len > 1:
+            off_acc = (cur_token[:, None] * stride_obs + split_k_id * stride_ok + cur_head[:, None] * stride_oh +
+                       offs_dv[None, :] * stride_od)
+        else:
+            off_acc = (cur_batch * stride_obs + split_k_id * stride_ok + cur_head[:, None] * stride_oh +
+                       offs_dv[None, :] * stride_od)
         tl.store(acc_out_ptr + off_acc, acc, mask=mask_h[:, None] & mask_dv[None, :])
 
     if quant_policy == Q_POLICY_INT4:
         off_meta = (cur_batch * stride_obs + split_k_id * stride_ok + cur_head * stride_oh + head_size_v * 2)
     elif quant_policy == Q_POLICY_TURBO:
         off_meta = (cur_batch * stride_obs + split_k_id * stride_ok + cur_head * stride_oh + head_size_v * 4)
+    elif seq_len > 1:
+        off_meta = (cur_token * stride_obs + split_k_id * stride_ok + cur_head * stride_oh + head_size_v)
     else:
         off_meta = (cur_batch * stride_obs + split_k_id * stride_ok + cur_head * stride_oh + head_size_v)
     tl.store(acc_out_ptr + off_meta, m_i, mask=mask_h)
@@ -798,7 +841,7 @@ def flash_attn_with_kvcache(
     cu_seqlens_q: Tensor = None,  # not used, for align with fa
     max_seqlen_q: int = None,
     softmax_scale: float = None,
-    causal: bool = False,  # not used, for align with fa
+    causal: bool = False,  # required for FP8 multi-token verification
     window_size: int = None,
     softcap: float = None,
     scheduler_metadata: Tensor = None,  # not used, for align with fa
@@ -907,6 +950,12 @@ def flash_attn_with_kvcache(
     BLOCK_DMODEL, BLOCK_DMODEL1, BLOCK_DV = _get_block_d(Lq, Lv)
     HEADS_PER_REQ = kv_group_num * seq_len
     BLOCK_H = max(16, min(BLOCK, triton.next_power_of_2(HEADS_PER_REQ)))
+    is_fp8_scalar = quant_policy in (QuantPolicy.FP8, QuantPolicy.FP8_E5M2)
+    if is_fp8_scalar and seq_len > 1:
+        if not causal:
+            raise NotImplementedError('FP8 multi-token paged attention requires causal=True.')
+        # Bound the live output accumulator while sharing KV across queries.
+        BLOCK_H = min(BLOCK_H, 32)
     TILES_PER_GROUP = triton.cdiv(HEADS_PER_REQ, BLOCK_H)
     grid_1 = TILES_PER_GROUP * num_kv_heads
 
@@ -919,8 +968,11 @@ def flash_attn_with_kvcache(
     else:
         num_warps, num_stages = _kernel_meta_sm9x(BLOCK_DMODEL, BLOCK_H)
 
-    is_fp8_scalar = quant_policy in (QuantPolicy.FP8, QuantPolicy.FP8_E5M2)
     SPLIT_K = _get_split_k(q.device.index, grid_1, batch, num_warps)
+    if is_fp8_scalar and seq_len > 1:
+        # Packing reduces query CTAs. Avoid compensating with excessive splits:
+        # the 128-way reduction dominates small batches at head_dim=256.
+        SPLIT_K = min(SPLIT_K, 64, triton.next_power_of_2(page_table.size(1)))
     use_pdl = is_cuda() and nv_cap[0] >= 9
     pdl_launch = {'launch_pdl': True} if use_pdl else {}
 
@@ -992,6 +1044,7 @@ def flash_attn_with_kvcache(
                                               stride_od=acc.stride(-1),
                                               stride_boffb=page_table.stride(0),
                                               kv_group_num=kv_group_num,
+                                              seq_len=seq_len if is_fp8_scalar else 1,
                                               window_size=window_size,
                                               head_size=Lq,
                                               head_size_v=Lv,

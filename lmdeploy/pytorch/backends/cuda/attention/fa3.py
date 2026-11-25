@@ -15,7 +15,7 @@ logger = get_logger('lmdeploy')
 
 @dataclass
 class FA3AttentionMetadata:
-    """Scheduler metadata owned by one FA3 configuration."""
+    """Native FA3 scheduling owned by one attention configuration."""
 
     scheduler_metadata: torch.Tensor = None
     max_kv_seqlen: int = None
@@ -89,6 +89,13 @@ def _build_fa3_metadata(batch_size: int,
         block_size = step_context.model_config.block_size
     if max_seqlen_q is None:
         max_seqlen_q = step_context.input_ids.size(1) // batch_size
+    if step_context.kv_quant_policy in (QuantPolicy.FP8, QuantPolicy.FP8_E5M2):
+        if not causal:
+            raise NotImplementedError('FP8 multi-token decode requires causal attention.')
+        if _normalize_sliding_window(sliding_window)[0] == 0:
+            raise NotImplementedError('FP8 multi-token decode does not support a zero-width sliding window.')
+        # The paged kernel consumes the existing per-request sequence metadata.
+        return FA3AttentionMetadata()
     if max_seqlen_k is None:
         # FA3 derives seqlen_k from the padded page table when
         # cu_seqlens_k is absent. The scheduler must use the same bound.
@@ -159,7 +166,7 @@ def build_fa3_graph_metadata(step_context,
 
 
 @dataclass(frozen=True)
-class FA3AttentionMetaBuilder(CudaAttentionMetaBuilder[torch.Tensor | None, FA3AttentionMetadata]):
+class FA3AttentionMetaBuilder(CudaAttentionMetaBuilder[FA3AttentionMetadata, FA3AttentionMetadata]):
     """Build metadata requested by one selected FA3 configuration."""
 
     num_heads: int
@@ -176,14 +183,14 @@ class FA3AttentionMetaBuilder(CudaAttentionMetaBuilder[torch.Tensor | None, FA3A
                 self.causal, self.has_softcap)
 
     @staticmethod
-    def _needs_scheduler(step_context, sequence_metadata) -> bool:
+    def _is_multi_token_decode(step_context, sequence_metadata) -> bool:
         if not step_context.is_decoding:
             return False
         batch_size = sequence_metadata.q_seqlens.size(0)
         return step_context.input_ids.size(1) > batch_size
 
     def build(self, step_context, sequence_metadata) -> FA3AttentionMetadata:
-        if not self._needs_scheduler(step_context, sequence_metadata):
+        if not self._is_multi_token_decode(step_context, sequence_metadata):
             return FA3AttentionMetadata()
         return build_fa3_metadata(
             sequence_metadata,
@@ -202,9 +209,9 @@ class FA3AttentionMetaBuilder(CudaAttentionMetaBuilder[torch.Tensor | None, FA3A
         if metadata.max_kv_seqlen is not None:
             attn_metadata.max_kv_seqlen = metadata.max_kv_seqlen
 
-    def make_cudagraph_buffer(self, graph_meta, input_buffers, step_context) -> torch.Tensor | None:
+    def make_cudagraph_buffer(self, graph_meta, input_buffers, step_context) -> FA3AttentionMetadata:
         if graph_meta.decode_query_len <= 1:
-            return None
+            return FA3AttentionMetadata()
         metadata = _build_fa3_metadata(
             input_buffers['q_seqlens'].size(0),
             input_buffers['kv_seqlens'],
@@ -220,11 +227,11 @@ class FA3AttentionMetaBuilder(CudaAttentionMetaBuilder[torch.Tensor | None, FA3A
             max_seqlen_q=graph_meta.decode_query_len,
             max_seqlen_k=graph_meta.num_blocks * graph_meta.block_size,
         )
-        return metadata.scheduler_metadata
+        return metadata
 
     def fill_cudagraph_buffer(self, graph_meta, input_buffers, step_context,
-                              buffer: torch.Tensor | None) -> FA3AttentionMetadata:
-        if buffer is None:
+                              buffer: FA3AttentionMetadata) -> FA3AttentionMetadata:
+        if buffer.scheduler_metadata is None:
             return FA3AttentionMetadata()
         metadata = _build_fa3_metadata(
             input_buffers['q_seqlens'].size(0),
@@ -242,10 +249,10 @@ class FA3AttentionMetaBuilder(CudaAttentionMetaBuilder[torch.Tensor | None, FA3A
             max_seqlen_k=graph_meta.num_blocks * graph_meta.block_size,
         )
         num_meta = metadata.scheduler_metadata.size(0)
-        buffer[:num_meta].copy_(metadata.scheduler_metadata)
-        buffer[num_meta:].zero_()
+        buffer.scheduler_metadata[:num_meta].copy_(metadata.scheduler_metadata)
+        buffer.scheduler_metadata[num_meta:].zero_()
         return FA3AttentionMetadata(
-            scheduler_metadata=buffer[:num_meta],
+            scheduler_metadata=buffer.scheduler_metadata[:num_meta],
             max_kv_seqlen=metadata.max_kv_seqlen,
         )
 
@@ -454,6 +461,34 @@ class FA3Impl(TritonAttentionImpl):
         )
         return attn_output
 
+    def _decoding_fp8_speculative(
+        self,
+        query: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        max_q_seqlen: int,
+        k_scales_zeros: torch.Tensor,
+        v_scales_zeros: torch.Tensor,
+    ) -> torch.Tensor:
+        """Decode FP8 KV without quantizing Q."""
+        # Query positions and GQA heads share a KV tile. The kernel applies a
+        # separate causal boundary to each query without expanding page tables.
+        output = self.paged_attention_fwd(
+            query, k_cache, v_cache,
+            cache_seqlens=attn_metadata.kv_seqlens,
+            page_table=attn_metadata.block_offsets,
+            max_seqlen_q=max_q_seqlen,
+            causal=self.causal,
+            softmax_scale=self.scale,
+            softcap=self.logit_softcapping,
+            window_size=self.sliding_window,
+            quant_policy=attn_metadata.quant_policy,
+            k_scales_zeros=k_scales_zeros,
+            v_scales_zeros=v_scales_zeros,
+        )
+        return output.unflatten(0, (-1, max_q_seqlen))
+
     def _forward_decoding(
         self,
         query: torch.Tensor,
@@ -483,6 +518,9 @@ class FA3Impl(TritonAttentionImpl):
             Attention output tensor.
         """
         if max_q_seqlen > 1:
+            if attn_metadata.quant_policy in (QuantPolicy.FP8, QuantPolicy.FP8_E5M2):
+                return self._decoding_fp8_speculative(query, k_cache, v_cache, attn_metadata, max_q_seqlen,
+                                                     k_scales_zeros, v_scales_zeros)
             return self._decoding_speculative(query, k_cache, v_cache, attn_metadata, max_q_seqlen)
         return self._decoding_standard(
             query,
