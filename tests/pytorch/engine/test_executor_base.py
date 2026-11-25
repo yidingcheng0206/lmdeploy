@@ -320,13 +320,14 @@ def test_get_min_num_gpu_blocks_rejects_worker_count_mismatch():
     (0, 2048, 1, torch.bfloat16), (9, 2048, 1, torch.float16),
     (0, 2048, 128, torch.bfloat16), (9, 2048, 128, torch.bfloat16),
 ])
-def test_runtime_size_reserves_dcp_peak_phase(monkeypatch, draft_tokens, topk, score_mb, dtype):
+@pytest.mark.parametrize('comm_backend', ['ag_rs', 'a2a'])
+def test_runtime_size_reserves_dcp_peak_phase(monkeypatch, draft_tokens, topk, score_mb, dtype, comm_backend):
     monkeypatch.setattr(executor_base._envs, 'dsa_indexer_max_logits_mb', score_mb)
     executor = object.__new__(ExecutorBase)
     executor.model_config = SimpleNamespace(mla_index_topk=topk, head_dim=576, v_head_dim=0,
                                             num_attention_heads=64, dtype=dtype)
     executor.specdecode_config = SimpleNamespace(num_speculative_tokens=draft_tokens) if draft_tokens else None
-    executor.dist_config = SimpleNamespace(attn_tp=8)
+    executor.dist_config = SimpleNamespace(attn_tp=8, dcp_comm_backend=comm_backend)
     executor.cache_config = SimpleNamespace(cache_max_entry_count=1.0,
                                             max_prefill_token_num=16,
                                             max_batches=2,
@@ -347,6 +348,12 @@ def test_runtime_size_reserves_dcp_peak_phase(monkeypatch, draft_tokens, topk, s
         # Scores count once; phase-local buffers overlap in the reservation,
         # while final indices remain live through attention.
         workspace = rows * topk * 4 + max(indexer_bytes, attention_bytes)
+    if comm_backend == 'a2a':
+        packet_words = decode_rows * 8 * 4 * ((576 * output_bytes + 3) // 4 + 1)
+        capacity = 1 << (packet_words - 1).bit_length()
+        # Both send/receive and every older geometric allocation remain live
+        # while prefill/indexer temporaries are used, shared by all layers.
+        workspace += 4 * capacity * 4
     expected = (16 + 4) * 100 * 2 + workspace
     assert runtime_size == expected
     assert num_tokens == 16

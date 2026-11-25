@@ -510,6 +510,11 @@ def test_dcp_cached_prefill_matches_reference_across_chunks(monkeypatch, sparse,
     else:
         assert metadata.dcp_prefill_request_ids is None
     impl_cls = FlashMLASparseImpl if sparse else mla_module.FlashMLAImpl
+    from lmdeploy.pytorch.backends.cuda.dcp import DCPManager
+    communicator = Mock()
+    communicator.create_all_gather_workspace.return_value = None
+    manager = DCPManager(SimpleNamespace(gpu_group=object(), rank=0, communicator=communicator), dcp_size)
+    monkeypatch.setattr(mla_module, 'get_dcp_manager', lambda: manager)
     kwargs = dict(mla_index_topk=512) if sparse else {}
     impl = impl_cls(num_heads=8,
                     head_size=576,
@@ -548,7 +553,13 @@ def test_dcp_cached_prefill_matches_reference_across_chunks(monkeypatch, sparse,
             remote[:prefix[rank::dcp_size].size(0)].copy_(prefix[rank::dcp_size])
         gather_calls += 1
 
-    monkeypatch.setattr(distributed, 'all_gather_into_tensor', gather)
+    def native_gather(input, **kwargs):
+        local = input.view(-1, 1, 576)
+        output = local.new_empty(dcp_size * local.size(0), 1, 576)
+        gather(output, local, group='dcp')
+        return output.flatten(1)
+
+    communicator.all_gather.side_effect = native_gather
     indices = None
     if use_sparse:
         # Non-contiguous selections span cached chunks and current tokens.
@@ -644,7 +655,7 @@ def test_reorder_dcp_prefill_kv_handles_uneven_requests(monkeypatch, dcp_size):
                         lambda **kwargs: len(lengths) * (1 + 2 * dcp_size) * 2)
     chunks = cp_utils.build_dcp_prefix_chunks(
         prefix_lens=prefix_lens, prefix_limit=max(lengths), block_size=1,
-        head_dim=1, dcp_world_rank=(dcp_size, 0))
+        kv_width=1, dcp_world_rank=(dcp_size, 0))
     for chunk in chunks:
         values = [request * 100 + torch.arange(length, device=device)[chunk.start:chunk.start + chunk.size]
                   for request, length in enumerate(lengths)]

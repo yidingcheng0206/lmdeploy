@@ -158,6 +158,10 @@ class CUDASingleGraphRunner:
         self.meta.input_buffers = self.model.make_buffers_cudagraph(self.meta, **kwargs)
         padded_kwargs = self._bind_inputs(**kwargs)
         capture_stream = torch.cuda.current_stream() if self._use_graph else None
+        from lmdeploy.pytorch.distributed import get_dist_manager
+        config = get_dist_manager().current_config()
+        self._dcp_workspace_stream = (capture_stream if config.dcp > 1 and config.dcp_comm_backend == 'a2a'
+                                      else None)
 
         # warmup
         warmup_output = self._model_forward(**padded_kwargs)
@@ -175,6 +179,9 @@ class CUDASingleGraphRunner:
     @record_function('forward_cudagraph')
     def forward(self, **kwargs):
         """Refill stable buffers and replay the captured model forward."""
+        stream = getattr(self, '_dcp_workspace_stream', None)
+        if stream is not None and torch.cuda.current_stream(stream.device) != stream:
+            raise RuntimeError('DCP graphs sharing A2A scratch must replay on their capture execution stream')
         padded_kwargs = self._bind_inputs(**kwargs)
         if self._use_graph:
             assert self._graph is not None

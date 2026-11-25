@@ -10,29 +10,50 @@ def get_dcp_topk_workspace_size(num_rows: int, topk: int, dcp_size: int) -> int:
     return num_rows * topk * (16 + 8 * dcp_size)
 
 
-def get_dcp_prefill_workspace_size(*, batch_size: int, head_dim: int, block_size: int, dcp_size: int) -> int:
+def get_dcp_prefill_workspace_size(*, batch_size: int, kv_width: int, block_size: int, dcp_size: int) -> int:
     """Per-rank prefix KV budget shared by chunk planning and cache sizing.
 
     Target 64 MiB, enlarged if one virtual block per request needs more. FP8 caches also gather dequantized BF16 KV.
     """
     # Simultaneous BF16 buffers: one local block, D gathered, D reordered.
-    minimum = batch_size * block_size * (1 + 2 * dcp_size) * head_dim * 2
+    minimum = batch_size * block_size * (1 + 2 * dcp_size) * kv_width * 2
     return max(64 << 20, minimum)
+
+
+def get_dcp_a2a_workspace_size(*, num_tokens: int, num_heads: int, head_dim: int,
+                              dtype: torch.dtype, dcp_size: int) -> int:
+    """Bound persistent A2A send/receive generations on one execution stream.
+
+    ``num_heads`` is rank-local before gathering. Each row stores raw output
+    bytes padded to INT32, plus FP32 LSE. Geometric growth retains less than
+    twice the largest allocation for each of the two buffers, across all layers.
+    """
+    if dcp_size <= 1 or num_tokens == 0:
+        return 0
+    words = (head_dim * dtype.itemsize + 3) // 4 + 1
+    elements = num_tokens * num_heads * dcp_size * words
+    capacity = 1 << (elements - 1).bit_length()
+    return 4 * capacity * torch.int32.itemsize
 
 
 def get_dcp_workspace_size(*, num_prefill_tokens: int, num_decode_tokens: int,
                            batch_size: int, num_heads: int, head_dim: int,
                            dtype: torch.dtype, block_size: int, dcp_size: int,
-                           topk: int | None, score_workspace_bytes: int) -> int:
+                           topk: int | None, score_workspace_bytes: int,
+                           comm_backend: str = 'ag_rs', kv_width: int | None = None) -> int:
     """Estimate per-rank peak temporary bytes for enabled DCP.
 
     ``num_heads`` is the rank-local query-head count before DCP gathering. Reserve max(indexer, attention) plus final
     indices shared by both phases. Flattened indexer KV relies on memory headroom.
     """
+    persistent = (get_dcp_a2a_workspace_size(
+        num_tokens=num_decode_tokens, num_heads=num_heads, head_dim=head_dim,
+        dtype=dtype, dcp_size=dcp_size) if comm_backend == 'a2a' else 0)
+    # Persistent decode arenas survive while prefill/indexer work is running.
     # Prefix KV: local, gathered, and reordered buffers.
     attention_workspace = get_dcp_prefill_workspace_size(
         batch_size=batch_size,
-        head_dim=head_dim,
+        kv_width=head_dim if kv_width is None else kv_width,
         block_size=block_size,
         dcp_size=dcp_size,
     )
@@ -44,7 +65,7 @@ def get_dcp_workspace_size(*, num_prefill_tokens: int, num_decode_tokens: int,
     # head_dim bounds the output width; standalone V-cache width is zero.
     attention_workspace += num_prefill_tokens * workspace_heads * 3 * (head_dim * dtype.itemsize + 4)
     if topk is None:
-        return attention_workspace
+        return persistent + attention_workspace
 
     # Cover both prefill and MTP verification.
     max_rows = max(num_prefill_tokens, num_decode_tokens)
@@ -52,7 +73,7 @@ def get_dcp_workspace_size(*, num_prefill_tokens: int, num_decode_tokens: int,
     indexer_workspace = score_workspace_bytes + get_dcp_topk_workspace_size(max_rows, topk, dcp_size)
     # Final INT32 ids survive into attention; other buffers are phase-local.
     index_bytes = max_rows * topk * 4
-    return index_bytes + max(indexer_workspace, attention_workspace)
+    return persistent + index_bytes + max(indexer_workspace, attention_workspace)
 
 
 @dataclass(frozen=True)
@@ -67,8 +88,19 @@ class DCPPrefixChunk:
     local_kv_seqlens: torch.Tensor  # [dcp_size, requests]
     local_cu_seqlens: torch.Tensor  # current rank
 
+    @property
+    def local_capacity(self) -> int:
+        """Padded local token capacity, identical on all DCP ranks."""
+        return self.kv_seqlens.numel() * self.size // self.local_kv_seqlens.size(0)
 
-def build_dcp_prefix_chunks(*, prefix_lens: torch.Tensor, prefix_limit: int, block_size: int, head_dim: int,
+    def local_block_slice(self, block_size: int) -> slice:
+        """Select this globally aligned chunk's rank-local cache blocks."""
+        virtual_block = block_size * self.local_kv_seqlens.size(0)
+        start = self.start // virtual_block
+        return slice(start, start + self.size // virtual_block)
+
+
+def build_dcp_prefix_chunks(*, prefix_lens: torch.Tensor, prefix_limit: int, block_size: int, kv_width: int,
                              dcp_world_rank: tuple[int, int]) -> tuple[DCPPrefixChunk, ...]:
     """Plan identical collective shapes on all ranks without device sync."""
     if prefix_limit <= 0:
@@ -76,11 +108,11 @@ def build_dcp_prefix_chunks(*, prefix_lens: torch.Tensor, prefix_limit: int, blo
     dcp_size, dcp_rank = dcp_world_rank
     batch_size = prefix_lens.numel()
     workspace_bytes = get_dcp_prefill_workspace_size(batch_size=batch_size,
-                                                     head_dim=head_dim,
+                                                     kv_width=kv_width,
                                                      block_size=block_size,
                                                      dcp_size=dcp_size)
     virtual_block_size = block_size * dcp_size
-    bytes_per_block = batch_size * block_size * (1 + 2 * dcp_size) * head_dim * 2
+    bytes_per_block = batch_size * block_size * (1 + 2 * dcp_size) * kv_width * 2
     # Longer prefixes add chunks rather than enlarge the gather buffers.
     chunk_size = (workspace_bytes // bytes_per_block) * virtual_block_size
     ranks = torch.arange(dcp_size, device=prefix_lens.device, dtype=prefix_lens.dtype)[:, None]
@@ -95,6 +127,14 @@ def build_dcp_prefix_chunks(*, prefix_lens: torch.Tensor, prefix_limit: int, blo
         local_cu_lens = torch.nn.functional.pad(local_lengths[dcp_rank].cumsum(0, dtype=torch.int32), (1, 0))
         chunks.append(DCPPrefixChunk(start, size, lengths, cu_lens, local_lengths, local_cu_lens))
     return tuple(chunks)
+
+
+def get_dcp_kv_width(model_config) -> int:
+    """Cached elements per token: shared MLA latent, or separate GQA K/V."""
+    if getattr(model_config, 'use_flash_mla', True):
+        return model_config.head_dim
+    _, num_kv_heads = model_config.get_num_qkv_head_by_tp()
+    return num_kv_heads * (model_config.k_head_dim + model_config.v_head_dim)
 
 
 def get_dcp_local_seq_lens(seq_lens: torch.Tensor,
@@ -150,7 +190,7 @@ def update_dcp_metadata(attn_metadata, step_context) -> None:
         prefix_lens=attn_metadata.kv_seqlens - attn_metadata.q_seqlens,
         prefix_limit=prefix_limit,
         block_size=step_context.cache_config.block_size,
-        head_dim=step_context.model_config.head_dim,
+        kv_width=get_dcp_kv_width(step_context.model_config),
         dcp_world_rank=dcp_world_rank,
     )
     topk = step_context.model_config.mla_index_topk

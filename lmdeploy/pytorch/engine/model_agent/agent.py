@@ -541,6 +541,9 @@ class BaseModelAgent:
 
     def warmup(self):
         """warmup."""
+        with self.all_context(), torch.cuda.stream(self.stream):
+            for manager in self._dcp_managers():
+                manager.prepare()
         from lmdeploy.pytorch.envs import skip_warmup
         if skip_warmup:
             if self.rank == 0:
@@ -1771,6 +1774,18 @@ class BaseModelAgent:
         """Get input processor."""
         return self.patched_model.get_input_processor()
 
+    def _dcp_managers(self):
+        """Unique target/draft managers, including a shared MTP context."""
+        contexts = (getattr(self, 'dist_ctx', None), getattr(self.spec_agent, 'draft_dist_ctx', None))
+        managers = []
+        for context in contexts:
+            manager = getattr(context, 'dcp_manager', None)
+            if manager is not None and manager not in managers:
+                managers.append(manager)
+        # Future providers can rendezvous here; preserve target/draft order
+        # across ranks instead of iterating a set of process-local objects.
+        return managers
+
     def reset_graph_runner(self):
         """Reset graph runner to prevent tp hanging."""
         with self.all_context():
@@ -1782,6 +1797,10 @@ class BaseModelAgent:
             self.spec_agent.reset_graph_runner()
             if self.memdecode_agent is not None:
                 self.memdecode_agent.reset_graph_runner()
+            # Target and draft can share one manager. Retire BOTH sets of graphs
+            # before releasing shared scratch, including sleep/weight updates.
+            for manager in self._dcp_managers():
+                manager.reset()
 
     def _split_updated_weights(self, weights: list[tuple[str, torch.Tensor]]):
         """Route HF-named update tensors before model-specific renaming."""

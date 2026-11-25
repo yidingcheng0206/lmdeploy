@@ -490,6 +490,17 @@ class DeepseekV2Attention(nn.Module):
             is_tp=True,
             quant_config=quantization_config,
         )
+        self._init_dcp_query_projection()
+
+    def _init_dcp_query_projection(self):
+        """Set up optional replicas; weights are populated after loading."""
+        self.dcp_world_size, _ = dist.get_dcp_world_rank()
+        self.dcp_replicate_q_proj = get_dist_manager().current_config().dcp_replicate_q_proj
+        self.dcp_query_projection = None
+        if self.dcp_replicate_q_proj:
+            from lmdeploy.pytorch.nn.dcp import DCPQueryProjection
+            projection = self.q_proj if self.q_lora_rank is None else self.q_b_proj
+            self.dcp_query_projection = DCPQueryProjection(projection)
 
     def process_weights_after_loading(self):
         """Build the local MLA BMM weights from the effective KV-B weight."""
@@ -502,24 +513,37 @@ class DeepseekV2Attention(nn.Module):
         w_kc, w_vc = weight.split([self.qk_nope_head_dim, self.v_head_dim], dim=1)
         self.kc.weight.copy_(w_kc)
         self.vc.weight.copy_(w_vc.transpose(1, 2).contiguous())
+        if self.dcp_query_projection is not None:
+            projection = self.q_proj if self.q_lora_rank is None else self.q_b_proj
+            self.dcp_query_projection.prepare(projection, self.kc)
 
-    def _q_proj(self, hidden_states, num_heads: int, nope_size: int, pe_size: int):
-        """Q proj."""
+    def _project_mla_query(self, hidden_states, num_heads: int, nope_size: int, pe_size: int,
+                           query_is_dcp_replicated: bool = False):
+        """Project and absorb Q using either local or DCP-replicated weights."""
         q_len = hidden_states.size(1)
-
         query_states = hidden_states.new_empty(q_len, num_heads, nope_size + pe_size)
-
-        if self.q_lora_rank is None:
-            q = self.q_proj(hidden_states)
+        if query_is_dcp_replicated:
+            q = self.dcp_query_projection.project(hidden_states)
         else:
-            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+            projection = self.q_proj if self.q_lora_rank is None else self.q_b_proj
+            q = projection(hidden_states)
         q = q.view(q_len, num_heads, self.q_head_dim)
         # q_pe: (q_len, num_heads, qk_rope_head_dim)
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         # q_nope: (q_len, num_heads, kv_lora_rank)
         q_nope_out = query_states[..., :nope_size]
-        self.kc(q_nope, q_nope_out)
+        if query_is_dcp_replicated:
+            self.dcp_query_projection.absorb(q_nope, q_nope_out)
+        else:
+            self.kc(q_nope, q_nope_out)
         return query_states, q_pe
+
+    def _q_proj(self, hidden_states, num_heads: int, nope_size: int, pe_size: int,
+                query_is_dcp_replicated: bool = False):
+        """Q proj."""
+        if self.q_lora_rank is not None:
+            hidden_states = self.q_a_layernorm(self.q_a_proj(hidden_states))
+        return self._project_mla_query(hidden_states, num_heads, nope_size, pe_size, query_is_dcp_replicated)
 
     def _kv_proj(self, hidden_states, nope_size: int):
         """Kv proj."""
@@ -533,11 +557,11 @@ class DeepseekV2Attention(nn.Module):
         key_states[..., :nope_size] = value_states
         return key_states, value_states, k_pe
 
-    def _qkv_proj(self, hidden_states: torch.Tensor, num_heads: int):
+    def _qkv_proj(self, hidden_states: torch.Tensor, num_heads: int, query_is_dcp_replicated: bool = False):
         """Qkv proj."""
         nope_size = self.kv_lora_rank
         pe_size = self.qk_rope_head_dim
-        query_states, q_pe = self._q_proj(hidden_states, num_heads, nope_size, pe_size)
+        query_states, q_pe = self._q_proj(hidden_states, num_heads, nope_size, pe_size, query_is_dcp_replicated)
         key_states, value_states, k_pe = self._kv_proj(hidden_states, nope_size)
 
         return query_states, key_states, value_states, q_pe, k_pe
@@ -555,7 +579,10 @@ class DeepseekV2Attention(nn.Module):
         q_len = hidden_states.size(1)
 
         # qkv_proj
-        query_states, key_states, value_states, q_pe, k_pe = self._qkv_proj(hidden_states, num_heads=num_heads)
+        query_is_dcp_replicated = self.dcp_replicate_q_proj and attn_metadata.is_decoding
+        query_heads = num_heads * self.dcp_world_size if query_is_dcp_replicated else num_heads
+        query_states, key_states, value_states, q_pe, k_pe = self._qkv_proj(
+            hidden_states, num_heads=query_heads, query_is_dcp_replicated=query_is_dcp_replicated)
 
         cos, sin = rotary_pos_emb
         q_pe, k_pe = self.apply_rotary_pos_emb(
@@ -578,6 +605,7 @@ class DeepseekV2Attention(nn.Module):
             k_scales_zeros=None if len(past_key_value) == 2 else past_key_value[2],
             v_scales_zeros=None if len(past_key_value) == 2 else past_key_value[3],
             inplace=True,
+            query_is_dcp_replicated=query_is_dcp_replicated,
         )
         attn_bmm_out = attn_output.new_empty(q_len, num_heads, self.v_head_dim)
 
@@ -1179,6 +1207,8 @@ class DeepseekV2Model(nn.Module):
 
 class DeepseekV2ForCausalLM(nn.Module, CudaGraphMixin):
     """Mixture model for causalLM."""
+
+    supports_dcp_q_replication = True
 
     def __init__(self,
                  config: Any,

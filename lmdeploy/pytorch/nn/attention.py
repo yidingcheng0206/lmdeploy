@@ -137,6 +137,7 @@ class Attention(nn.Module):
         s_aux: torch.Tensor = None,
         nsa_indices: torch.Tensor = None,
         inplace: bool = True,
+        query_is_dcp_replicated: bool = False,
     ) -> torch.Tensor:
         """forward."""
         self._lazy_init(query.device)
@@ -152,6 +153,8 @@ class Attention(nn.Module):
             v_scales_zeros = self.v_scale
 
         kwargs = dict()
+        if query_is_dcp_replicated:
+            kwargs['query_is_dcp_replicated'] = True
         if nsa_indices is not None:
             kwargs['nsa_indices'] = nsa_indices
         if s_aux is not None:

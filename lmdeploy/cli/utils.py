@@ -182,12 +182,17 @@ class ArgumentHelper:
     def dcp(parser):
         """Add argument dcp to parser."""
 
-        return parser.add_argument(
+        action = parser.add_argument(
             '--dcp',
             type=int,
             default=1,
             help='Decode context parallelism size for the PyTorch backend. '
-            'It reuses ranks inside each tensor-parallel group, and tp must be a multiple of dcp')
+            'It reuses ranks inside each attention TP group; resolved attention TP must be a multiple of dcp')
+        parser.add_argument('--dcp-comm-backend', choices=['ag_rs', 'a2a'], default='ag_rs',
+                            help='DCP decode output communication backend (default: ag_rs)')
+        parser.add_argument('--dcp-replicate-q-proj', action='store_true',
+                            help='Replicate BF16 MLA query projections inside DCP groups to skip decode Q gather')
+        return action
 
     @staticmethod
     def dp(parser):

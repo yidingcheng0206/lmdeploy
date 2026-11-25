@@ -379,6 +379,7 @@ class DeepseekV32Attention(DeepseekV2Attention):
             prefix=add_prefix('o_proj', prefix),
         )
 
+        self._init_dcp_query_projection()
         self.indexer = self._build_indexer(config, layer_idx, dtype, device, prefix)
 
     def _build_indexer(self,
@@ -389,24 +390,11 @@ class DeepseekV32Attention(DeepseekV2Attention):
                        prefix: str = ''):
         return Indexer(config, layer_idx, dtype=dtype, device=device)
 
-    def _q_proj(self, q_a_states, num_heads: int, nope_size: int, pe_size: int):
+    def _q_proj(self, q_a_states, num_heads: int, nope_size: int, pe_size: int,
+                query_is_dcp_replicated: bool = False):
         """Q proj."""
-        q_len = q_a_states.size(1)
-
-        query_states = q_a_states.new_empty(q_len, num_heads, nope_size + pe_size)
-
-        if self.q_lora_rank is None:
-            qr = q_a_states
-            q = self.q_proj(q_a_states)
-        else:
-            qr = self.q_a_layernorm(q_a_states)
-            q = self.q_b_proj(qr)
-        q = q.view(q_len, num_heads, self.q_head_dim)
-        # q_pe: (q_len, num_heads, qk_rope_head_dim)
-        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        # q_nope: (q_len, num_heads, kv_lora_rank)
-        q_nope_out = query_states[..., :nope_size]
-        self.kc(q_nope, q_nope_out)
+        qr = q_a_states if self.q_lora_rank is None else self.q_a_layernorm(q_a_states)
+        query_states, q_pe = self._project_mla_query(qr, num_heads, nope_size, pe_size, query_is_dcp_replicated)
         return query_states, q_pe, qr
 
     def _kv_proj(self, key_states, nope_size: int):
@@ -419,7 +407,7 @@ class DeepseekV32Attention(DeepseekV2Attention):
         key_states[..., :nope_size] = value_states
         return key_states, value_states, k_pe
 
-    def _qkv_proj(self, hidden_states: torch.Tensor, num_heads: int):
+    def _qkv_proj(self, hidden_states: torch.Tensor, num_heads: int, query_is_dcp_replicated: bool = False):
         """Qkv proj."""
         nope_size = self.kv_lora_rank
         pe_size = self.qk_rope_head_dim
@@ -431,7 +419,7 @@ class DeepseekV32Attention(DeepseekV2Attention):
                 [self.q_lora_rank, nope_size + pe_size], dim=-1)
             key_states = key_states[0, :, None]
 
-        query_states, q_pe, qr = self._q_proj(q_a_states, num_heads, nope_size, pe_size)
+        query_states, q_pe, qr = self._q_proj(q_a_states, num_heads, nope_size, pe_size, query_is_dcp_replicated)
         key_states, value_states, k_pe = self._kv_proj(key_states, nope_size)
 
         return query_states, key_states, value_states, q_pe, k_pe, qr
@@ -449,7 +437,10 @@ class DeepseekV32Attention(DeepseekV2Attention):
         q_len = hidden_states.size(1)
 
         # qkv_proj
-        query_states, key_states, value_states, q_pe, k_pe, qr = self._qkv_proj(hidden_states, num_heads=num_heads)
+        query_is_dcp_replicated = self.dcp_replicate_q_proj and attn_metadata.is_decoding
+        query_heads = num_heads * self.dcp_world_size if query_is_dcp_replicated else num_heads
+        query_states, key_states, value_states, q_pe, k_pe, qr = self._qkv_proj(
+            hidden_states, num_heads=query_heads, query_is_dcp_replicated=query_is_dcp_replicated)
 
         cos, sin = rotary_pos_emb
         q_pe, k_pe = self.apply_rotary_pos_emb(
@@ -474,6 +465,7 @@ class DeepseekV32Attention(DeepseekV2Attention):
             k_scales_zeros=None if len(past_key_value) == 2 else past_key_value[2],
             v_scales_zeros=None if len(past_key_value) == 2 else past_key_value[3],
             nsa_indices=topk_indices,
+            query_is_dcp_replicated=query_is_dcp_replicated,
         )
         attn_bmm_out = attn_output.new_empty(q_len, num_heads, self.v_head_dim)
 
@@ -590,6 +582,7 @@ class DeepseekV32Model(DeepseekV2Model):
 
 
 class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
+    supports_dcp_q_replication = True
     model_cls = DeepseekV32Model
 
     def __init__(self,

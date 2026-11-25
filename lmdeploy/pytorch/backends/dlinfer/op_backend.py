@@ -129,7 +129,7 @@ class DlinferOpsBackend(DefaultOpsBackend):
         return DlinferCacheBackend
 
     @classmethod
-    def build_communicator(cls, cpu_group, device_group, dist_config):
+    def build_communicator(cls, cpu_group, device_group, dist_config, *, group_name='tp'):
         """Build a DLInfer communicator."""
         from lmdeploy.pytorch import envs
         cuda_communicator_enabled = envs.enable_flashinfer_allreduce or envs.enable_symm_mem_allreduce
@@ -138,6 +138,7 @@ class DlinferOpsBackend(DefaultOpsBackend):
             cpu_group=cpu_group,
             device_group=device_group,
             dist_config=dist_config,
+            group_name=group_name,
         )
 
     @staticmethod

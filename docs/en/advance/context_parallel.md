@@ -50,11 +50,81 @@ disables DCP.
 - Requires NVIDIA Hopper/SM90 GPUs, FlashMLA, and BF16 activations.
   Sparse DSA also requires compatible DeepGEMM and TileLang top-k kernels
   (top-k 512 or 2048).
-- `dcp` must divide the attention TP size and replicated KV-head count;
-  `dp=1` and `ep=1` are required.
+- `dcp` must divide the resolved attention TP size and replicated KV-head count.
+  DCP groups stay inside attention TP groups and can be combined with DP/EP.
+  For example, `--tp 8 --dp 2 --ep 8 --dcp 4` uses eight GPUs, two attention
+  TP groups of four ranks, and one DCP group inside each attention TP group.
 - Prefix caching and `deepseek_mtp` are supported for compatible MLA models,
   including DeepSeek V3/V3.1, DeepSeek V3.2, and GLM DSA.
 - BF16 KV cache is supported. Sparse MLA also supports FP8 KV cache via
   `--quant-policy fp8`.
 - Sliding-window attention, MemDecode, prefill/decode disaggregation,
   external KV-cache connectors, and the TileLang attention backend are not supported.
+
+### Decode communication options
+
+`--dcp-comm-backend ag_rs` is the default. It gathers Q, gathers the shard
+log-sum-exp (LSE), then reduce-scatters the corrected attention output.
+`--dcp-comm-backend a2a` instead exchanges output and FP32 LSE in one
+all-to-all and combines the received states locally. The final output still
+contains only this rank's attention heads. Both backends support CUDA Graph.
+
+For supported BF16 MLA query projections, `--dcp-replicate-q-proj` gathers
+the Q projection and absorbed key projection weights once inside each DCP
+group after loading. Decode then computes all DCP-group query heads locally,
+avoiding Q all-gather. Prefill keeps using the original local head slices.
+The option requires `dcp > 1`, adds weight memory and projection work, and
+does not change attention TP, MLP TP, or EP groups.
+
+```bash
+lmdeploy serve api_server <bf16-mla-model> --backend pytorch \
+  --tp 8 --dp 2 --ep 8 --dcp 4 \
+  --dcp-comm-backend a2a --dcp-replicate-q-proj
+```
+
+Python exposes the same options:
+
+```python
+PytorchEngineConfig(tp=8, dp=2, ep=8, dcp=4,
+                    dcp_comm_backend='a2a', dcp_replicate_q_proj=True)
+```
+
+Q replication is opt-in and currently supports the DeepSeek V2/V3, DeepSeek
+V3.2, and GLM DSA model implementations with unquantized BF16 Q projections.
+Quantized Q projections, LoRA, and model implementations that have not opted
+in (including MTP draft models) are rejected. A2A does not require Q
+replication and can be used with the existing quantized MLA paths. GQA DCP
+support is outside this implementation.
+
+Long-context FP8 sparse MLA smoke tests have shown occasional retrieval
+errors with both the pre-A2A baseline (main plus the DP/EP configuration
+changes) and `a2a`. The root cause has not been isolated; this evidence
+neither establishes a regression caused by A2A nor validates its FP8
+quality. End-to-end FP8 quality validation remains incomplete.
+
+The DCP attention communication chain uses three collectives with `ag_rs`,
+two with `a2a`, and one with `a2a` plus Q replication. These counts exclude
+output projection, MoE, and sparse indexer communication. Benchmark the
+desired workload before enabling the optimizations: fewer collectives do
+not guarantee lower end-to-end latency.
+
+### Communication resources
+
+Each distributed context owns one `DCPManager`, bound to its DCP group.
+Attention, sparse-indexer candidate gathering, and cached-prefix KV gathering
+use this manager. Different DP groups keep separate managers and may process
+different batch sizes; collective shapes must agree within each DCP group.
+
+A2A send/receive scratch is shared across layers on the same CUDA execution
+stream. Different streams use separate buffers. Buffers grow geometrically,
+and older allocations remain alive while captured graphs can reference them.
+Warmup must allocate enough space before graph capture. Graphs sharing this
+scratch must replay serially on their capture execution stream; the graph
+runner checks that stream. Reset retires target and draft graphs before
+releasing shared scratch. Cache sizing reserves this persistent memory in
+addition to prefill/indexer temporary memory.
+
+The group communicator currently uses native PyTorch/NCCL collectives.
+Its workspace interface allows a future optimized gather provider; this
+refactor does not enable symmetric-memory transport or change the attention
+merge arithmetic.

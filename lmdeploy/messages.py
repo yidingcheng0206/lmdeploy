@@ -476,6 +476,11 @@ class PytorchEngineConfig:
         tp: Tensor Parallelism. default 1.
         dcp: Decode context parallelism size. It reuses ranks inside
             each attention tensor-parallel group. Default 1.
+        dcp_comm_backend: DCP decode output communication, ``ag_rs`` (default)
+            or ``a2a``. The latter exchanges output and FP32 LSE together.
+        dcp_replicate_q_proj: Replicate MLA query projection weights inside
+            each DCP group to avoid gathering decode queries. Requires
+            unquantized BF16 MLA without LoRA. Default False.
         dp: Data Parallelism. default 1.
         dp_rank: rank of dp.
         ep: Expert Parallelism. default 1.
@@ -578,6 +583,8 @@ class PytorchEngineConfig:
     dtype: str = 'auto'
     tp: int = 1
     dcp: int = 1
+    dcp_comm_backend: str = 'ag_rs'
+    dcp_replicate_q_proj: bool = False
     dp: int = 1
     dp_rank: int = 0
     ep: int = 1
@@ -642,7 +649,11 @@ class PytorchEngineConfig:
         assert self.dtype in ['auto', 'float16', 'bfloat16']
         assert self.tp >= 1, 'invalid tp'
         assert self.dcp >= 1, 'invalid dcp'
-        assert self.tp % self.dcp == 0, 'tp must be divisible by dcp'
+        assert self.dcp_comm_backend in ('ag_rs', 'a2a'), 'invalid dcp_comm_backend'
+        if self.dcp_replicate_q_proj:
+            assert self.dcp > 1, 'DCP query projection replication requires dcp > 1'
+            assert not self.adapters, 'DCP query projection replication does not support LoRA'
+        # DCP divisibility is checked against the resolved attention TP in DistConfig.
         if self.dcp > 1:
             assert self.device_type == 'cuda', 'DCP requires CUDA'
             assert self.kv_transfer_config is None, 'DCP does not support KV-cache connectors'

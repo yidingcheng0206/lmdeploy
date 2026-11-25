@@ -260,6 +260,8 @@ class DistConfig:
     # tp
     tp: int = 1  # default tp, equal to attn_tp
     dcp: int = 1  # decode context parallelism inside attention tp
+    dcp_comm_backend: str = 'ag_rs'
+    dcp_replicate_q_proj: bool = False
     attn_tp: int = None  # tp for attention
     mlp_tp: int = None  # tp for mlp
     moe_tp: int = None  # tp for moe
@@ -273,8 +275,11 @@ class DistConfig:
         assert self.dp_rank < self.dp
         assert self.dp >= 1
         assert self.dcp >= 1
-        if self.dcp > 1:
-            assert self.dp == 1 and self.ep == 1, 'DCP currently requires dp=1 and ep=1'
+        assert self.dcp_comm_backend in ('ag_rs', 'a2a'), 'invalid dcp_comm_backend'
+        # EngineConfig validates public options early. DistConfig also supports
+        # direct construction and owns the final, resolved topology checks.
+        if self.dcp_replicate_q_proj:
+            assert self.dcp > 1, 'DCP query projection replication requires dcp > 1'
 
         dp = self.dp
         tp = self.tp
@@ -343,6 +348,8 @@ class DistConfig:
             enable_eplb=engine_config.enable_eplb,
             tp=engine_config.tp,
             dcp=engine_config.dcp,
+            dcp_comm_backend=engine_config.dcp_comm_backend,
+            dcp_replicate_q_proj=engine_config.dcp_replicate_q_proj,
             attn_tp=engine_config.attn_tp_size,
             mlp_tp=engine_config.mlp_tp_size,
             moe_tp=engine_config.moe_tp_size,

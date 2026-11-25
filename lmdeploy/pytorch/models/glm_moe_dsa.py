@@ -237,8 +237,10 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         nope_size = self.kv_lora_rank
         q_len = hidden_states.size(1)
 
-        query_states, key_states, value_states, q_pe, k_pe, qr = self._qkv_proj(hidden_states,
-                                                                                num_heads=num_heads)
+        query_is_dcp_replicated = self.dcp_replicate_q_proj and attn_metadata.is_decoding
+        query_heads = num_heads * self.dcp_world_size if query_is_dcp_replicated else num_heads
+        query_states, key_states, value_states, q_pe, k_pe, qr = self._qkv_proj(
+            hidden_states, num_heads=query_heads, query_is_dcp_replicated=query_is_dcp_replicated)
         cos, sin = rotary_pos_emb
         q_pe, k_pe = self.apply_rotary_pos_emb(q_pe, k_pe, cos, sin, inplace=False)
         query_states[..., nope_size:] = q_pe
@@ -265,6 +267,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             k_scales_zeros=None if len(past_key_value) == 2 else past_key_value[2],
             v_scales_zeros=None if len(past_key_value) == 2 else past_key_value[3],
             nsa_indices=topk_indices,
+            query_is_dcp_replicated=query_is_dcp_replicated,
         )
         attn_bmm_out = attn_output.new_empty(q_len, num_heads, self.v_head_dim)
         self.vc(attn_output, attn_bmm_out)
@@ -360,6 +363,7 @@ class GlmMoeDsaModel(DeepseekV32Model):
 
 
 class GlmMoeDsaForCausalLM(DeepseekV32ForCausalLM, PiecewiseCudaGraphMixin):
+    supports_dcp_q_replication = True
     model_cls = GlmMoeDsaModel
 
     def __init__(self,

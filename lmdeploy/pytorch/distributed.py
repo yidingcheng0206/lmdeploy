@@ -14,6 +14,7 @@ from .config import DistConfig, TPMode
 
 if TYPE_CHECKING:
     from .backends.communicator import DeviceCommunicator
+    from .backends.cuda.dcp import DCPManager
 
 
 @dataclass
@@ -237,17 +238,20 @@ def _build_dcp_group(context: 'DistContext', timeout: timedelta,
     )
 
 
-def _build_tp_communicators(context: 'DistContext'):
-    """Attach one communicator to each rank-local, unique TP group."""
+def _build_communicators(context: 'DistContext'):
+    """Attach communicators to the existing, rank-local TP and DCP groups."""
     build_communicator = context.communicator_builder
     groups = (context.attn_tp_group, context.mlp_tp_group, context.moe_tp_group)
-    for group in {id(group): group for group in groups}.values():
+    named_groups = [('tp', group) for group in {id(group): group for group in groups}.values()]
+    named_groups.append(('dcp', context.dcp_group))
+    for group_name, group in named_groups:
         if group.gpu_group is None:
             continue
         group.communicator = build_communicator(
             cpu_group=group.cpu_group,
             device_group=group.gpu_group,
             dist_config=context.dist_config,
+            group_name=group_name,
         )
 
 
@@ -262,6 +266,7 @@ class DistContext:
     mlp_tp_group: DistGroup = None
     moe_tp_group: DistGroup = None
     dcp_group: DistGroup = None
+    dcp_manager: 'DCPManager' = None
 
     cpu_group: dist.ProcessGroup = None
     ep_gpu_group: dist.ProcessGroup = None
@@ -330,10 +335,11 @@ class DistContext:
 
         # tp
         _build_tp_group(context, timeout, cpu_backend=cpu_backend, ccl_backend=ccl_backend)
-        _build_tp_communicators(context)
 
         # cp
         _build_dcp_group(context, timeout, cpu_backend=cpu_backend, ccl_backend=ccl_backend)
+
+        _build_communicators(context)
 
         # ep
         cls._build_ep_group(context, timeout, ccl_backend=ccl_backend)
@@ -341,7 +347,10 @@ class DistContext:
         return context
 
     def close(self):
-        """Close groups."""
+        """Close DCP resources after graphs retire, before process groups."""
+        if self.dcp_manager is not None:
+            self.dcp_manager.close()
+            self.dcp_manager = None
         if not dist.is_initialized():
             return
         if self.dcp_group is not None:
@@ -523,6 +532,13 @@ def reduce_scatter_tensor(output, input, op=ReduceOp.SUM, group='tp', async_op=F
     if isinstance(group, str):
         group = get_group(group, 'gpu')
     return dist.reduce_scatter_tensor(output, input, op=op, group=group, async_op=async_op)
+
+
+def all_to_all_single(output, input, group='tp', async_op=False):
+    """Exchange equal-sized rank-major chunks."""
+    if isinstance(group, str):
+        group = get_group(group, 'gpu')
+    return dist.all_to_all_single(output, input, group=group, async_op=async_op)
 
 
 def gather_by_tp_sizes(x: torch.Tensor,

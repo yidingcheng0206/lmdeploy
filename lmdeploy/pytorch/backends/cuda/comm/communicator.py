@@ -70,8 +70,14 @@ def should_try_symm_mem(dist_config) -> bool:
 
 
 def build_cuda_communicator(cpu_group: dist.ProcessGroup, device_group: dist.ProcessGroup,
-                            dist_config):
+                            dist_config, *, group_name: str = 'tp'):
     """Build the optional CUDA communicator for a TP group."""
+    if group_name == 'dcp':
+        # DCP uses its own process group, including inside DP/EP deployments.
+        # TP all-reduce eligibility must not disable native DCP collectives.
+        return DeviceCommunicator(device_group=device_group)
+    if group_name != 'tp':
+        raise ValueError(f'Unknown communicator group: {group_name}')
     compatible = dist_config.dp == 1 and dist_config.ep == 1 and not dist_config.enable_microbatch
     enabled = _envs.enable_flashinfer_allreduce or should_try_symm_mem(dist_config)
     if not compatible or not enabled:

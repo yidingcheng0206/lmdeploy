@@ -270,6 +270,8 @@ class SubCliServe:
                 dtype=args.dtype,
                 tp=args.tp,
                 dcp=args.dcp,
+                dcp_comm_backend=args.dcp_comm_backend,
+                dcp_replicate_q_proj=args.dcp_replicate_q_proj,
                 dp=args.dp,
                 ep=args.ep,
                 max_batch_size=max_batch_size,
